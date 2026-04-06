@@ -1,0 +1,7 @@
+{
+  "mediaFolders": ["/path/to/your/movies"],
+  "tvFolder": "/path/to/your/tv shows",
+  "preferredAudioLang": "eng",
+  "tmdbApiKey": "your_tmdb_api_key_here",
+  "port": 3000
+}
