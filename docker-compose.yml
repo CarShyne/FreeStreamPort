@@ -8,8 +8,8 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ${MEDIA_PATH:-/mnt/media/movies}:/media/movies:ro
-      - ${TV_PATH:-/mnt/media/tvshows}:/media/tvshows:ro
+      - ${MEDIA_PATH:-/mnt/media/movies (Example)
+      - ${TV_PATH:-/mnt/media/tvshows   (Example)
       - freestream-settings:/app/server
       - /tmp/freestream-hls:/tmp/freestream-hls
     environment:
