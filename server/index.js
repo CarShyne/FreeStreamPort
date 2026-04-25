@@ -13,7 +13,7 @@ const app = express();
 const PORT = 3000;
 app.use(express.static(path.join(__dirname, '../client')));
 
-const MEDIA_FOLDER = process.env.MEDIA_FOLDER || "/Volumes/2TB/Movies.2TB";
+const MEDIA_FOLDER = process.env.MEDIA_FOLDER || "/Volumes/YOUR MEDIA PATH";
 const TMDB_API_KEY = process.env.TMDB_API_KEY || "866794356a9e7ac61771ae56bd99e284";
 const HLS_TMP = '/tmp/freestream-hls';
 
