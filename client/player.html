@@ -46,42 +46,80 @@
 <body>
 <button id="close-btn" onclick="window.close()">✕</button>
 <div id="loading">Preparing stream...</div>
-<video id="player" controls autoplay x-webkit-airplay="allow"></video>
+<video id="player" controls autoplay playsinline x-webkit-airplay="allow"></video>
+<script src="/vendor/hls.js/dist/hls.min.js"></script>
 <script>
     const file = new URLSearchParams(window.location.search).get('file');
     const loading = document.getElementById('loading');
     const player = document.getElementById('player');
 
+    function showError(message) {
+        loading.style.display = 'flex';
+        loading.textContent = message;
+    }
+
+    function playHls(url) {
+        if (window.Hls && Hls.isSupported()) {
+            const hls = new Hls();
+            hls.loadSource(url);
+            hls.attachMedia(player);
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                loading.style.display = 'none';
+                player.play().catch(() => {});
+            });
+            hls.on(Hls.Events.ERROR, (_, data) => {
+                if (data.fatal) showError('Stream failed to load');
+            });
+            return;
+        }
+        if (player.canPlayType('application/vnd.apple.mpegurl')) {
+            player.src = url;
+            loading.style.display = 'none';
+            player.play().catch(() => {});
+            return;
+        }
+        showError('HLS not supported in this browser');
+    }
+
     async function startStream() {
         const tvfile = new URLSearchParams(window.location.search).get('tvfile');
         const target = tvfile || file;
-        if (!target) return;
-
-        if (target.toLowerCase().endsWith('.mp4')) {
-            loading.style.display = 'none';
-            if (tvfile) {
-                player.src = 'http://192.168.0.121:3000/tv-media/' + tvfile;
-            } else {
-                player.src = 'http://192.168.0.121:3000/stream-mp4?file=' + encodeURIComponent(file);
-            }
+        if (!target) {
+            showError('No file specified');
             return;
         }
-        const endpoint = tvfile ? '/start-stream?tvfile=' + tvfile : '/start-stream?file=' + encodeURIComponent(file);
+
+        player.addEventListener('error', () => showError('Could not play video'));
+
+        if (target.toLowerCase().endsWith('.mp4')) {
+            if (tvfile) {
+                player.src = '/tv-media/' + encodeURI(tvfile);
+            } else {
+                player.src = '/stream-mp4?file=' + encodeURIComponent(file);
+            }
+            loading.style.display = 'none';
+            player.play().catch(() => {});
+            return;
+        }
+
+        const endpoint = tvfile
+            ? '/start-stream?tvfile=' + encodeURIComponent(tvfile)
+            : '/start-stream?file=' + encodeURIComponent(file);
         const res = await fetch(endpoint);
+        if (!res.ok) {
+            showError('Could not start stream');
+            return;
+        }
         const { url } = await res.json();
-        loading.style.display = 'none';
-        player.src = url;
+        playHls(url);
     }
 
-    // Auto-hide controls
     let hideTimer;
     function showControls() {
         document.getElementById('close-btn').style.opacity = '1';
-        document.getElementById('audio-btn').style.opacity = '1';
         clearTimeout(hideTimer);
         hideTimer = setTimeout(() => {
             document.getElementById('close-btn').style.opacity = '0';
-            document.getElementById('audio-btn').style.opacity = '0';
         }, 3000);
     }
     document.addEventListener('mousemove', showControls);

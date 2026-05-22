@@ -12,8 +12,9 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3000;
 app.use(express.static(path.join(__dirname, '../client')));
+app.use('/vendor', express.static(path.join(__dirname, 'node_modules')));
 
-const MEDIA_FOLDER = process.env.MEDIA_FOLDER || "/Volumes/YOUR MEDIA PATH";
+const MEDIA_FOLDER = process.env.MEDIA_FOLDER || "/Volumes/2TB/Movies.2TB";
 const TMDB_API_KEY = process.env.TMDB_API_KEY || "866794356a9e7ac61771ae56bd99e284";
 const HLS_TMP = '/tmp/freestream-hls';
 
@@ -21,6 +22,14 @@ if (!fs.existsSync(HLS_TMP)) fs.mkdirSync(HLS_TMP, { recursive: true });
 
 const metadataCache = {};
 const activeStreams = {};
+
+function resolveMediaPath(file, folders) {
+    for (const folder of folders) {
+        const p = path.join(folder, file);
+        if (fs.existsSync(p)) return p;
+    }
+    return null;
+}
 
 function getLocalIP() {
     const nets = os.networkInterfaces();
@@ -170,6 +179,8 @@ app.get('/hls/:streamId/index.m3u8', (req, res) => {
 app.get('/hls/:streamId/:segment', (req, res) => {
     const { streamId, segment } = req.params;
     const segPath = path.join(HLS_TMP, streamId, segment);
+    if (!fs.existsSync(segPath)) return res.status(404).send('Segment not found');
+    res.setHeader('Content-Type', segment.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.sendFile(segPath);
 });
@@ -179,7 +190,17 @@ app.get('/start-stream', (req, res) => {
     const file = req.query.file;
     const tvfile = req.query.tvfile;
     const target = tvfile || file;
-    const fullPath = tvfile ? path.join(TV_FOLDER, decodeURIComponent(tvfile)) : path.join(MEDIA_FOLDER, file);
+    const settings = loadSettings();
+    let fullPath;
+    if (tvfile) {
+        const tvFolder = settings.tvFolder || TV_FOLDER;
+        fullPath = path.join(tvFolder, decodeURIComponent(tvfile));
+    } else {
+        const folders = settings.mediaFolders || [MEDIA_FOLDER];
+        fullPath = resolveMediaPath(file, folders);
+    }
+    if (!fullPath || !fs.existsSync(fullPath)) return res.status(404).json({ error: 'File not found' });
+
     const streamId = Buffer.from(target).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
     const outDir = path.join(HLS_TMP, streamId);
 
@@ -204,10 +225,7 @@ app.get('/start-stream', (req, res) => {
         ? ['-c:v', 'copy']
         : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23'];
 
-    const settings = loadSettings();
     const audioLang = settings.preferredAudioLang || 'eng';
-
-    // Find preferred audio stream index
     let audioMap = ['-map', '0:a:0']; // default first audio
     try {
         const probeResult = execSync(`ffprobe -v error -select_streams a -show_entries stream=index:stream_tags=language -of json "${fullPath}"`).toString();
@@ -241,14 +259,16 @@ app.get('/start-stream', (req, res) => {
     ffmpeg.on('error', err => console.error('[FFmpeg spawn error]', err));
     ffmpeg.on('close', () => delete activeStreams[streamId]);
 
-    const localIP = getLocalIP();
-    res.json({ streamId, url: `http://${localIP}:${PORT}/hls/${streamId}/index.m3u8` });
+    res.json({ streamId, url: `/hls/${streamId}/index.m3u8` });
 });
 
 // Range request support for MP4
 app.get('/stream-mp4', (req, res) => {
     const file = req.query.file;
-    const fullPath = path.join(MEDIA_FOLDER, file);
+    const settings = loadSettings();
+    const folders = settings.mediaFolders || [MEDIA_FOLDER];
+    const fullPath = resolveMediaPath(file, folders);
+    if (!fullPath) return res.status(404).send('File not found');
     const stat = fs.statSync(fullPath);
     const fileSize = stat.size;
     const range = req.headers.range;
@@ -283,7 +303,7 @@ app.listen(PORT, () => {
 });
 
 // TV Shows endpoint
-const TV_FOLDER = process.env.TV_FOLDER || "/Volumes/2TB/Movies.2TB/TV Shows";
+const TV_FOLDER = "/Volumes/2TB/Movies.2TB/TV Shows";
 
 async function getTVMetadata(showName) {
     if (metadataCache['tv_' + showName]) return metadataCache['tv_' + showName];

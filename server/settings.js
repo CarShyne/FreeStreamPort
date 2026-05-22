@@ -7,7 +7,7 @@ const __dirname = path.dirname(__filename);
 const SETTINGS_FILE = path.join(__dirname, 'settings.json');
 
 const DEFAULTS = {
-    mediaFolders: ["/Volumes/Movies],
+    mediaFolders: ["/Volumes/2TB/Movies.2TB"],
     tvFolder: "/Volumes/TV Shows",
     preferredAudioLang: "eng",
     tmdbApiKey: "866794356a9e7ac61771ae56bd99e284",
