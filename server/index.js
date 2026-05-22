@@ -5,16 +5,18 @@ import os from 'os';
 import { exec, spawn, execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import fetch from 'node-fetch';
+import { loadSettings, saveSettings, APP_VERSION } from './settings.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT, 10) || 3000;
 app.use(express.static(path.join(__dirname, '../client')));
 app.use('/vendor', express.static(path.join(__dirname, 'node_modules')));
 
 const MEDIA_FOLDER = process.env.MEDIA_FOLDER || "/Volumes/2TB/Movies.2TB";
+const TV_FOLDER = process.env.TV_FOLDER || "/Volumes/2TB/Movies.2TB/TV Shows";
 const TMDB_API_KEY = process.env.TMDB_API_KEY || "866794356a9e7ac61771ae56bd99e284";
 const HLS_TMP = '/tmp/freestream-hls';
 
@@ -23,12 +25,80 @@ if (!fs.existsSync(HLS_TMP)) fs.mkdirSync(HLS_TMP, { recursive: true });
 const metadataCache = {};
 const activeStreams = {};
 
+function getMediaFolders(settings) {
+    if (process.env.MEDIA_FOLDER) return [process.env.MEDIA_FOLDER];
+    const folders = settings?.mediaFolders?.filter(Boolean);
+    return folders?.length ? folders : [MEDIA_FOLDER];
+}
+
+function checkFolder(folder) {
+    const normalized = folder.replace(/\/+$/, '');
+    try {
+        if (!fs.existsSync(normalized)) return { path: folder, ok: false, error: 'Path not found — is the drive connected?' };
+        if (!fs.statSync(normalized).isDirectory()) return { path: folder, ok: false, error: 'Path is not a folder' };
+        return { path: normalized, ok: true };
+    } catch (e) {
+        return { path: folder, ok: false, error: e.message };
+    }
+}
+
+function getAccessibleMediaFolders(settings) {
+    const configured = getMediaFolders(settings);
+    const checked = configured.map(checkFolder);
+    return {
+        folders: checked.filter(f => f.ok).map(f => f.path),
+        status: checked
+    };
+}
+
+function logFolderStatus(settings) {
+    if (process.env.MEDIA_FOLDER) console.log(`MEDIA_FOLDER (env): ${process.env.MEDIA_FOLDER}`);
+    if (process.env.TV_FOLDER) console.log(`TV_FOLDER (env): ${process.env.TV_FOLDER}`);
+    const media = getAccessibleMediaFolders(settings);
+    const tv = checkFolder(getTvFolder(settings));
+    media.status.forEach(f => {
+        if (!f.ok) console.warn(`Media folder unavailable: ${f.path} (${f.error})`);
+    });
+    if (!tv.ok) console.warn(`TV folder unavailable: ${tv.path} (${tv.error})`);
+    if (media.folders.length) console.log(`Media folders ready: ${media.folders.join(', ')}`);
+    if (tv.ok) console.log(`TV folder ready: ${tv.path}`);
+}
+
+function getTvFolder(settings) {
+    return process.env.TV_FOLDER || settings?.tvFolder || TV_FOLDER;
+}
+
 function resolveMediaPath(file, folders) {
+    const normalized = file.split('/').join(path.sep);
     for (const folder of folders) {
-        const p = path.join(folder, file);
+        const p = path.join(folder, normalized);
         if (fs.existsSync(p)) return p;
     }
     return null;
+}
+
+function scanMediaFiles(dir, rootDir = dir, results = []) {
+    let entries;
+    try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) {
+        return results;
+    }
+    for (const entry of entries) {
+        if (entry.name.startsWith('._')) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+            const lower = entry.name.toLowerCase();
+            if (lower === 'tv shows' || lower === 'tvshows') continue;
+            scanMediaFiles(full, rootDir, results);
+        } else if (/\.(mp4|mkv)$/i.test(entry.name)) {
+            results.push({
+                file: path.relative(rootDir, full).split(path.sep).join('/'),
+                folder: rootDir
+            });
+        }
+    }
+    return results;
 }
 
 function getLocalIP() {
@@ -98,7 +168,8 @@ function parseFilename(filename) {
 
 async function getMetadata(filename) {
     if (metadataCache[filename]) return metadataCache[filename];
-    const { title, year } = MANUAL_OVERRIDES[filename] || parseFilename(filename);
+    const basename = path.basename(filename);
+    const { title, year } = MANUAL_OVERRIDES[basename] || MANUAL_OVERRIDES[filename] || parseFilename(basename);
     try {
         const movie = await searchTMDB(title, year);
         const result = movie ? {
@@ -119,14 +190,17 @@ async function getMetadata(filename) {
 app.get('/movies', async (req, res) => {
     try {
         const settings = loadSettings();
-        const folders = settings.mediaFolders || [MEDIA_FOLDER];
+        const { folders, status } = getAccessibleMediaFolders(settings);
+        if (!folders.length) {
+            return res.status(503).json({
+                error: 'No media folders available',
+                folders: status,
+                hint: 'Connect your drive and check the path in Settings (gear icon).'
+            });
+        }
         const allFiles = [];
         for (const folder of folders) {
-            try {
-                const files = fs.readdirSync(folder)
-                    .filter(f => (f.endsWith('.mp4') || f.endsWith('.mkv')) && !f.startsWith('._'));
-                files.forEach(f => allFiles.push({ file: f, folder }));
-            } catch(e) { console.error('Cannot read folder:', folder); }
+            scanMediaFiles(folder).forEach(item => allFiles.push(item));
         }
         const movies = await Promise.all(allFiles.map(async ({ file: f, folder }) => {
             const meta = await getMetadata(f);
@@ -145,7 +219,7 @@ app.get('/movies', async (req, res) => {
 app.get('/open', (req, res) => {
     const file = req.query.file;
     const settings = loadSettings();
-    const folders = settings.mediaFolders || [MEDIA_FOLDER];
+    const folders = getMediaFolders(settings);
     let fullPath = null;
     for (const folder of folders) {
         const p = path.join(folder, file);
@@ -193,11 +267,9 @@ app.get('/start-stream', (req, res) => {
     const settings = loadSettings();
     let fullPath;
     if (tvfile) {
-        const tvFolder = settings.tvFolder || TV_FOLDER;
-        fullPath = path.join(tvFolder, decodeURIComponent(tvfile));
+        fullPath = path.join(getTvFolder(settings), decodeURIComponent(tvfile));
     } else {
-        const folders = settings.mediaFolders || [MEDIA_FOLDER];
-        fullPath = resolveMediaPath(file, folders);
+        fullPath = resolveMediaPath(file, getMediaFolders(settings));
     }
     if (!fullPath || !fs.existsSync(fullPath)) return res.status(404).json({ error: 'File not found' });
 
@@ -266,8 +338,7 @@ app.get('/start-stream', (req, res) => {
 app.get('/stream-mp4', (req, res) => {
     const file = req.query.file;
     const settings = loadSettings();
-    const folders = settings.mediaFolders || [MEDIA_FOLDER];
-    const fullPath = resolveMediaPath(file, folders);
+    const fullPath = resolveMediaPath(file, getMediaFolders(settings));
     if (!fullPath) return res.status(404).send('File not found');
     const stat = fs.statSync(fullPath);
     const fileSize = stat.size;
@@ -298,12 +369,11 @@ app.get('/stream-mp4', (req, res) => {
 app.use('/media', express.static(MEDIA_FOLDER));
 
 app.listen(PORT, () => {
-    console.log(`FreeStream running: http://localhost:${PORT}`);
+    const settings = loadSettings();
+    logFolderStatus(settings);
+    console.log(`FreeStream v${APP_VERSION} running: http://localhost:${PORT}`);
     console.log(`Local IP: ${getLocalIP()}`);
 });
-
-// TV Shows endpoint
-const TV_FOLDER = "/Volumes/2TB/Movies.2TB/TV Shows";
 
 async function getTVMetadata(showName) {
     if (metadataCache['tv_' + showName]) return metadataCache['tv_' + showName];
@@ -328,18 +398,21 @@ async function getTVMetadata(showName) {
 
 app.get('/tvshows', async (req, res) => {
     try {
-        const shows = fs.readdirSync(TV_FOLDER)
-            .filter(f => fs.statSync(`${TV_FOLDER}/${f}`).isDirectory());
+        const tvFolder = getTvFolder(loadSettings());
+        const shows = fs.readdirSync(tvFolder)
+            .filter(f => fs.statSync(path.join(tvFolder, f)).isDirectory());
         const metadata = await Promise.all(shows.map(getTVMetadata));
         res.json(metadata);
     } catch(err) {
+        console.error('Cannot read TV folder:', err.message);
         res.status(500).json({ error: 'Could not read TV folder' });
     }
 });
 
 app.get('/tvshows/episodes', (req, res) => {
     const show = req.query.show;
-    const showPath = `${TV_FOLDER}/${show}`;
+    const tvFolder = getTvFolder(loadSettings());
+    const showPath = path.join(tvFolder, show);
     try {
         const episodes = [];
         const scanDir = (dir, prefix) => {
@@ -360,18 +433,27 @@ app.get('/tvshows/episodes', (req, res) => {
     }
 });
 
-app.use('/tv-media', express.static(TV_FOLDER));
+app.use('/tv-media', (req, res, next) => {
+    express.static(getTvFolder(loadSettings()))(req, res, next);
+});
 
 app.get('/clear-cache', (req, res) => {
     Object.keys(metadataCache).forEach(k => delete metadataCache[k]);
     res.send('Cache cleared');
 });
 
-// Settings
-import { loadSettings, saveSettings } from './settings.js';
-
 app.get('/api/settings', (req, res) => {
     res.json(loadSettings());
+});
+
+app.get('/api/status', (req, res) => {
+    const settings = loadSettings();
+    const media = getAccessibleMediaFolders(settings);
+    res.json({
+        version: APP_VERSION,
+        mediaFolders: media.status,
+        tvFolder: checkFolder(getTvFolder(settings))
+    });
 });
 
 app.post('/api/settings', express.json(), (req, res) => {

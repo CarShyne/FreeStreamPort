@@ -367,6 +367,7 @@
         @keyframes settingsIn { from{transform:scale(0.95) translateY(10px);opacity:0} to{transform:scale(1) translateY(0);opacity:1} }
         .settings-header { padding:20px 24px 16px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid rgba(255,255,255,0.06); }
         .settings-header h2 { font-size:18px; font-weight:600; color:#fff; }
+        .settings-version { font-size:12px; font-weight:500; color:#00d4ff; margin-left:8px; opacity:0.8; }
         .settings-close { background:rgba(255,255,255,0.08); border:none; border-radius:50%; width:28px; height:28px; display:flex; align-items:center; justify-content:center; color:#888; cursor:pointer; }
         .settings-close:hover { background:rgba(255,255,255,0.15); color:#fff; }
         .settings-body { padding:8px 0; overflow-y:auto; flex:1; }
@@ -501,7 +502,7 @@
     <div class="settings-overlay" onclick="closeSettings()"></div>
     <div class="settings-card">
         <div class="settings-header">
-            <h2>Settings</h2>
+            <h2>Settings <span id="app-version" class="settings-version"></span></h2>
             <button class="settings-close" onclick="closeSettings()">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6 6 18M6 6l12 12"/></svg>
             </button>

@@ -8,10 +8,9 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ${MEDIA_PATH:-/mnt/media/movies (Example)
-      - ${TV_PATH:-/mnt/media/tvshows   (Example)
-      - freestream-settings:/app/server
-      - /tmp/freestream-hls:/tmp/freestream-hls
+      - /srv/dev-disk-by-uuid-ef6d3ece-2b16-4ae0-bda5-3c5fe4d26ebc/2TB/Movies.2TB:/media/movies
+      - /srv/dev-disk-by-uuid-ef6d3ece-2b16-4ae0-bda5-3c5fe4d26ebc/2TB/Movies.2TB/TV Shows:/media/tvshows
+      - freestream-hls:/tmp/freestream-hls
     environment:
       - MEDIA_FOLDER=/media/movies
       - TV_FOLDER=/media/tvshows

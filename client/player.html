@@ -89,19 +89,6 @@
             return;
         }
 
-        player.addEventListener('error', () => showError('Could not play video'));
-
-        if (target.toLowerCase().endsWith('.mp4')) {
-            if (tvfile) {
-                player.src = '/tv-media/' + encodeURI(tvfile);
-            } else {
-                player.src = '/stream-mp4?file=' + encodeURIComponent(file);
-            }
-            loading.style.display = 'none';
-            player.play().catch(() => {});
-            return;
-        }
-
         const endpoint = tvfile
             ? '/start-stream?tvfile=' + encodeURIComponent(tvfile)
             : '/start-stream?file=' + encodeURIComponent(file);

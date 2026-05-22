@@ -3,7 +3,17 @@ let currentMovie = null;
 
 async function loadMovies() {
     const res = await fetch('/movies');
-    allMovies = await res.json();
+    const data = await res.json();
+    if (!res.ok) {
+        const grid = document.getElementById('grid');
+        grid.innerHTML = `<div style="grid-column:1/-1;padding:40px;text-align:center;color:#888;">
+            <p style="color:#ff6b6b;margin-bottom:8px;">${data.error || 'Could not load library'}</p>
+            <p style="font-size:13px;margin-bottom:16px;">${data.hint || ''}</p>
+            <button class="btn-play" onclick="openSettings()">Open Settings</button>
+        </div>`;
+        return;
+    }
+    allMovies = data;
     currentMovies = allMovies.filter(m => !m.filename?.toLowerCase().includes('tv shows'));
     renderGrid(currentMovies);
 }
@@ -145,6 +155,13 @@ async function openSettings() {
     document.getElementById('audio-lang').value = settings.preferredAudioLang || 'eng';
     document.getElementById('tmdb-key').value = settings.tmdbApiKey || '';
     document.getElementById('server-port').value = settings.port || 3000;
+    document.getElementById('app-version').textContent = settings.version ? `v${settings.version}` : '';
+
+    const pathsLocked = settings.pathsFromEnv;
+    document.querySelectorAll('#media-folders-list .settings-input, #tv-folder').forEach(el => {
+        el.readOnly = pathsLocked;
+        el.title = pathsLocked ? 'Paths are set by Docker environment variables' : '';
+    });
 
     document.getElementById('settings-modal').style.display = 'flex';
 }
