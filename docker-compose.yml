@@ -8,14 +8,11 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - /srv/dev-disk-by-uuid-ef6d3ece-2b16-4ae0-bda5-3c5fe4d26ebc/2TB/Movies.2TB:/media/movies
-      - /srv/dev-disk-by-uuid-ef6d3ece-2b16-4ae0-bda5-3c5fe4d26ebc/2TB/Movies.2TB/TV Shows:/media/tvshows
-      - freestream-hls:/tmp/freestream-hls
+      - ${MEDIA_PATH:-/mnt/media/movies}:/media/movies
+      - ${TV_PATH:-/mnt/media/tvshows}:/media/tvshows
+      - /tmp/freestream-hls:/tmp/freestream-hls
     environment:
       - MEDIA_FOLDER=/media/movies
       - TV_FOLDER=/media/tvshows
       - PORT=3000
       - TMDB_API_KEY=866794356a9e7ac61771ae56bd99e284
-
-volumes:
-  freestream-settings:

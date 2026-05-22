@@ -442,6 +442,10 @@ app.get('/clear-cache', (req, res) => {
     res.send('Cache cleared');
 });
 
+app.get('/api/version', (req, res) => {
+    res.json({ version: APP_VERSION });
+});
+
 app.get('/api/settings', (req, res) => {
     res.json(loadSettings());
 });
