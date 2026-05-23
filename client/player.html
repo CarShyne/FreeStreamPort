@@ -46,28 +46,52 @@
 <body>
 <button id="close-btn" onclick="window.close()">✕</button>
 <div id="loading">Preparing stream...</div>
-<video id="player" controls autoplay playsinline x-webkit-airplay="allow"></video>
+<video id="player" controls autoplay playsinline preload="auto" x-webkit-airplay="allow"></video>
 <script src="/vendor/hls.js/dist/hls.min.js"></script>
 <script>
     const file = new URLSearchParams(window.location.search).get('file');
     const loading = document.getElementById('loading');
     const player = document.getElementById('player');
+    let hlsInstance = null;
 
     function showError(message) {
         loading.style.display = 'flex';
         loading.textContent = message;
     }
 
+    function mediaUrl(path) {
+        return path.split('/').map(encodeURIComponent).join('/');
+    }
+
+    function playDirect(url) {
+        loading.textContent = 'Loading...';
+        player.src = url;
+        player.addEventListener('loadedmetadata', () => {
+            loading.style.display = 'none';
+            player.play().catch(() => {});
+        }, { once: true });
+        player.addEventListener('error', () => {
+            startHlsStream();
+        }, { once: true });
+    }
+
     function playHls(url) {
         if (window.Hls && Hls.isSupported()) {
-            const hls = new Hls();
-            hls.loadSource(url);
-            hls.attachMedia(player);
-            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            if (hlsInstance) hlsInstance.destroy();
+            hlsInstance = new Hls({
+                enableWorker: true,
+                backBufferLength: Infinity,
+                maxBufferLength: 30,
+                maxMaxBufferLength: 600,
+                liveDurationInfinity: true,
+            });
+            hlsInstance.loadSource(url);
+            hlsInstance.attachMedia(player);
+            hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
                 loading.style.display = 'none';
                 player.play().catch(() => {});
             });
-            hls.on(Hls.Events.ERROR, (_, data) => {
+            hlsInstance.on(Hls.Events.ERROR, (_, data) => {
                 if (data.fatal) showError('Stream failed to load');
             });
             return;
@@ -81,13 +105,12 @@
         showError('HLS not supported in this browser');
     }
 
-    async function startStream() {
+    async function startHlsStream() {
         const tvfile = new URLSearchParams(window.location.search).get('tvfile');
-        const target = tvfile || file;
-        if (!target) {
-            showError('No file specified');
-            return;
-        }
+        loading.style.display = 'flex';
+        loading.textContent = 'Preparing stream...';
+        player.removeAttribute('src');
+        player.load();
 
         const endpoint = tvfile
             ? '/start-stream?tvfile=' + encodeURIComponent(tvfile)
@@ -99,6 +122,25 @@
         }
         const { url } = await res.json();
         playHls(url);
+    }
+
+    async function startStream() {
+        const tvfile = new URLSearchParams(window.location.search).get('tvfile');
+        const target = tvfile || file;
+        if (!target) {
+            showError('No file specified');
+            return;
+        }
+
+        if (target.toLowerCase().endsWith('.mp4')) {
+            const url = tvfile
+                ? '/tv-media/' + mediaUrl(tvfile)
+                : '/stream-mp4?file=' + encodeURIComponent(file);
+            playDirect(url);
+            return;
+        }
+
+        await startHlsStream();
     }
 
     let hideTimer;

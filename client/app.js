@@ -66,7 +66,17 @@ async function openModal(movie) {
             </button>`).join('') +
         '</div>';
     } else {
-        actions.innerHTML = '<button class="btn-play" onclick="playMovie()"><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>Play</button>';
+        actions.innerHTML = `
+            <div class="modal-actions-row">
+                <button class="btn-play" onclick="playMovie()">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                    Play
+                </button>
+                <button class="btn-play btn-download" onclick="downloadMovie()">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+                    Download
+                </button>
+            </div>`;
     }
 
     document.getElementById('modal').style.display = 'flex';
@@ -84,6 +94,16 @@ function closeModal() {
 function playMovie() {
     if (!currentMovie) return;
     window.open('/player.html?file=' + encodeURIComponent(currentMovie.filename), '_blank');
+}
+
+function downloadMovie() {
+    if (!currentMovie) return;
+    const a = document.createElement('a');
+    a.href = '/download?file=' + encodeURIComponent(currentMovie.filename);
+    a.download = currentMovie.filename.split('/').pop();
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
 }
 
 document.getElementById('search').addEventListener('input', e => {

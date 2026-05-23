@@ -68,6 +68,20 @@ function getTvFolder(settings) {
     return process.env.TV_FOLDER || settings?.tvFolder || TV_FOLDER;
 }
 
+function resolveFilePath(file, tvfile, settings) {
+    if (tvfile) {
+        return path.join(getTvFolder(settings), decodeURIComponent(tvfile));
+    }
+    return resolveMediaPath(file, getMediaFolders(settings));
+}
+
+function mimeForPath(filePath) {
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext === '.mp4') return 'video/mp4';
+    if (ext === '.mkv') return 'video/x-matroska';
+    return 'application/octet-stream';
+}
+
 function resolveMediaPath(file, folders) {
     const normalized = file.split('/').join(path.sep);
     for (const folder of folders) {
@@ -265,12 +279,7 @@ app.get('/start-stream', (req, res) => {
     const tvfile = req.query.tvfile;
     const target = tvfile || file;
     const settings = loadSettings();
-    let fullPath;
-    if (tvfile) {
-        fullPath = path.join(getTvFolder(settings), decodeURIComponent(tvfile));
-    } else {
-        fullPath = resolveMediaPath(file, getMediaFolders(settings));
-    }
+    const fullPath = resolveFilePath(file, tvfile, settings);
     if (!fullPath || !fs.existsSync(fullPath)) return res.status(404).json({ error: 'File not found' });
 
     const streamId = Buffer.from(target).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
@@ -294,8 +303,10 @@ app.get('/start-stream', (req, res) => {
     console.log('Input codec:', inputCodec, 'for', fullPath);
 
     const videoArgs = inputCodec === 'h264'
-        ? ['-c:v', 'copy']
-        : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23'];
+        ? (isMkv
+            ? ['-c:v', 'copy']
+            : ['-c:v', 'copy', '-bsf:v', 'h264_mp4toannexb'])
+        : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-g', '48', '-keyint_min', '48', '-sc_threshold', '0'];
 
     const audioLang = settings.preferredAudioLang || 'eng';
     let audioMap = ['-map', '0:a:0']; // default first audio
@@ -318,9 +329,10 @@ app.get('/start-stream', (req, res) => {
         '-c:a', 'aac',
         '-b:a', '192k',
         '-ac', '2',
-        '-hls_time', '4',
+        '-hls_time', '2',
         '-hls_list_size', '0',
-        '-hls_flags', 'independent_segments',
+        '-hls_playlist_type', 'event',
+        '-hls_flags', 'independent_segments+append_list',
         '-hls_segment_filename', path.join(outDir, 'seg%03d.ts'),
         path.join(outDir, 'index.m3u8')
     ], { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -364,6 +376,22 @@ app.get('/stream-mp4', (req, res) => {
         });
         fs.createReadStream(fullPath).pipe(res);
     }
+});
+
+app.get('/download', (req, res) => {
+    const { file, tvfile } = req.query;
+    if (!file && !tvfile) return res.status(400).send('Missing file parameter');
+    const settings = loadSettings();
+    const fullPath = resolveFilePath(file, tvfile, settings);
+    if (!fullPath || !fs.existsSync(fullPath)) return res.status(404).send('File not found');
+
+    const basename = path.basename(fullPath);
+    const stat = fs.statSync(fullPath);
+    res.setHeader('Content-Type', mimeForPath(fullPath));
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Content-Disposition', `attachment; filename="${basename.replace(/"/g, '')}"; filename*=UTF-8''${encodeURIComponent(basename)}`);
+    fs.createReadStream(fullPath).pipe(res);
 });
 
 app.use('/media', express.static(MEDIA_FOLDER));
