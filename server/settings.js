@@ -9,8 +9,8 @@ const SETTINGS_FILE = path.join(__dirname, 'settings.json');
 export const APP_VERSION = '1.0.2';
 
 const DEFAULTS = {
-    mediaFolders: [process.env.MEDIA_FOLDER || "/Volumes/2TB/Movies.2TB"],
-    tvFolder: process.env.TV_FOLDER || "/Volumes/2TB/Movies.2TB/TV Shows",
+    mediaFolders: [process.env.MEDIA_FOLDER || "/media/Movies.2TB"],
+    tvFolder: process.env.TV_FOLDER || "/media/TV Shows",
     preferredAudioLang: "eng",
     tmdbApiKey: process.env.TMDB_API_KEY || "866794356a9e7ac61771ae56bd99e284",
     port: parseInt(process.env.PORT, 10) || 3000
