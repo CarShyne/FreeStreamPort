@@ -2,15 +2,57 @@
 <html>
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <title>FreeStream Player</title>
     <link href="https://fonts.googleapis.com/css2?family=Advent+Pro:wght@500&display=swap" rel="stylesheet">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
-        video { width: 100%; height: 100%; object-fit: contain; display: block; }
-        #loading {
+        html, body {
+            width: 100%;
+            height: 100%;
+            min-height: 100vh;
+            min-height: 100dvh;
+            background: #000;
+            overflow: hidden;
+        }
+        #player-wrap {
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100vh;
+            height: 100dvh;
+            background: #000;
+        }
+        video {
             position: absolute;
             inset: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            object-position: center;
+            display: block;
+            background: #000;
+        }
+        video.fill-tv { object-fit: cover; }
+        html:fullscreen #player-wrap,
+        html:-webkit-full-screen #player-wrap {
+            width: 100%;
+            height: 100%;
+        }
+        html:fullscreen video,
+        html:-webkit-full-screen video,
+        video:fullscreen,
+        video:-webkit-full-screen {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+        html:fullscreen video.fill-tv,
+        video:fullscreen.fill-tv { object-fit: cover; }
+        #loading {
+            position: fixed;
+            inset: 0;
+            z-index: 10;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -19,40 +61,75 @@
             font-size: 16px;
             background: #000;
         }
-        #close-btn {
+        .player-btn {
             position: fixed;
-            bottom: 80px;
-            left: 24px;
             z-index: 999;
-            width: 40px;
             height: 40px;
-            border-radius: 50%;
+            min-width: 40px;
+            padding: 0 14px;
+            border-radius: 20px;
             background: rgba(0,0,0,0.6);
             backdrop-filter: blur(8px);
             border: 1px solid rgba(255,255,255,0.15);
-            color: rgba(255,255,255,0.8);
-            font-size: 18px;
+            color: rgba(255,255,255,0.85);
+            font-family: 'Advent Pro', sans-serif;
+            font-size: 13px;
             cursor: pointer;
             display: flex;
             align-items: center;
             justify-content: center;
+            gap: 6px;
             opacity: 0;
             transition: opacity 0.3s, background 0.2s;
         }
-        body:hover #close-btn { opacity: 1; }
-        #close-btn:hover { background: rgba(255,255,255,0.15); color: #fff; }
+        body.show-controls .player-btn { opacity: 1; }
+        .player-btn:hover { background: rgba(255,255,255,0.15); color: #fff; }
+        #close-btn { bottom: 80px; left: 24px; }
+        #fullscreen-btn { bottom: 80px; left: 76px; }
+        #fit-btn { bottom: 80px; left: 168px; }
     </style>
 </head>
 <body>
-<button id="close-btn" onclick="window.close()">✕</button>
+<button id="close-btn" class="player-btn" onclick="window.close()">✕</button>
+<button id="fullscreen-btn" class="player-btn" onclick="toggleFullscreen()">⛶ Fullscreen</button>
+<button id="fit-btn" class="player-btn" onclick="toggleFit()">Fit: Letterbox</button>
 <div id="loading">Preparing stream...</div>
-<video id="player" controls autoplay playsinline preload="auto" x-webkit-airplay="allow"></video>
+<div id="player-wrap">
+    <video id="player" controls autoplay playsinline webkit-playsinline preload="auto" x-webkit-airplay="allow" airplay="allow"></video>
+</div>
 <script src="/vendor/hls.js/dist/hls.min.js"></script>
 <script>
     const file = new URLSearchParams(window.location.search).get('file');
     const loading = document.getElementById('loading');
     const player = document.getElementById('player');
     let hlsInstance = null;
+    let fillTv = localStorage.getItem('freestream-fill-tv') === '1';
+
+    function applyFitMode() {
+        player.classList.toggle('fill-tv', fillTv);
+        document.getElementById('fit-btn').textContent = fillTv ? 'Fit: Fill TV' : 'Fit: Letterbox';
+    }
+
+    function toggleFit() {
+        fillTv = !fillTv;
+        localStorage.setItem('freestream-fill-tv', fillTv ? '1' : '0');
+        applyFitMode();
+        showControls();
+    }
+
+    function toggleFullscreen() {
+        if (document.fullscreenElement || document.webkitFullscreenElement) {
+            (document.exitFullscreen || document.webkitExitFullscreen)?.call(document);
+        } else {
+            enterFullscreen();
+        }
+        showControls();
+    }
+
+    function enterFullscreen() {
+        const el = document.documentElement;
+        return (el.requestFullscreen || el.webkitRequestFullscreen)?.call(el);
+    }
 
     function showError(message) {
         loading.style.display = 'flex';
@@ -145,16 +222,23 @@
 
     let hideTimer;
     function showControls() {
-        document.getElementById('close-btn').style.opacity = '1';
+        document.body.classList.add('show-controls');
         clearTimeout(hideTimer);
-        hideTimer = setTimeout(() => {
-            document.getElementById('close-btn').style.opacity = '0';
-        }, 3000);
+        hideTimer = setTimeout(() => document.body.classList.remove('show-controls'), 3000);
     }
+
     document.addEventListener('mousemove', showControls);
     document.addEventListener('touchstart', showControls);
+    player.addEventListener('dblclick', toggleFullscreen);
+    document.addEventListener('fullscreenchange', showControls);
+    document.addEventListener('webkitfullscreenchange', showControls);
 
+    applyFitMode();
+    showControls();
     startStream();
+
+    // Fullscreen helps tab/screen cast fill the TV instead of mirroring a small window
+    enterFullscreen().catch(() => {});
 </script>
 </body>
 </html>
