@@ -1,0 +1,26 @@
+# Portainer / NAS stack — pulls pre-built image from Docker Hub.
+# Git pushes do NOT update this automatically unless the image is rebuilt & pushed.
+# After a new image is published: Portainer → freestream → Pull & redeploy
+
+version: '3.8'
+
+services:
+  freestream:
+    image: jt7777/freestream:latest
+    container_name: freestream
+    restart: unless-stopped
+    user: "0:0"
+    ports:
+      - "3001:3000"
+    volumes:
+      - /srv/dev-disk-by-uuid-ef6d3ece-2b16-4ae0-bda5-3c5fe4d26ebc/2TB/Movies.2TB:/media/movies
+      - /srv/dev-disk-by-uuid-ef6d3ece-2b16-4ae0-bda5-3c5fe4d26ebc/2TB/Movies.2TB/Tv Shows:/media/Tv
+      - freestream-hls:/tmp/freestream-hls
+    environment:
+      - MEDIA_FOLDER=/media/movies
+      - TV_FOLDER=/media/Tv
+      - PORT=3000
+      - TMDB_API_KEY=866794356a9e7ac61771ae56bd99e284
+
+volumes:
+  freestream-hls:

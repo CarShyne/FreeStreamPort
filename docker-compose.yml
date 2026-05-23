@@ -1,3 +1,4 @@
+# Local dev — builds from source
 version: '3.8'
 
 services:
