@@ -140,49 +140,120 @@
         return path.split('/').map(encodeURIComponent).join('/');
     }
 
-    function playDirect(url) {
-        loading.textContent = 'Loading...';
-        player.src = url;
-        player.addEventListener('loadedmetadata', () => {
+    const HLS_START_BUFFER_SEC = 10;
+    const MP4_START_BUFFER_SEC = 4;
+    let playbackStarted = false;
+
+    function bufferedAhead() {
+        const ranges = player.buffered;
+        if (!ranges.length) return 0;
+        return ranges.end(ranges.length - 1) - player.currentTime;
+    }
+
+    function showBuffering() {
+        loading.style.display = 'flex';
+        loading.textContent = 'Buffering...';
+    }
+
+    function bufferTarget(minSeconds) {
+        const duration = player.duration;
+        if (!isNaN(duration) && isFinite(duration) && duration < minSeconds) {
+            return Math.max(0.5, duration * 0.4);
+        }
+        return minSeconds;
+    }
+
+    function tryStartPlayback(minSeconds) {
+        if (playbackStarted) return;
+        if (bufferedAhead() >= bufferTarget(minSeconds)) {
+            playbackStarted = true;
             loading.style.display = 'none';
             player.play().catch(() => {});
-        }, { once: true });
+        }
+    }
+
+    function playDirect(url) {
+        playbackStarted = false;
+        loading.textContent = 'Loading...';
+        loading.style.display = 'flex';
+        player.src = url;
+        const onProgress = () => tryStartPlayback(MP4_START_BUFFER_SEC);
+        player.addEventListener('progress', onProgress);
+        player.addEventListener('canplaythrough', onProgress, { once: true });
+        player.addEventListener('loadedmetadata', onProgress, { once: true });
+        player.addEventListener('waiting', showBuffering);
+        player.addEventListener('playing', () => {
+            if (playbackStarted) loading.style.display = 'none';
+        });
         player.addEventListener('error', () => {
             startHlsStream();
         }, { once: true });
     }
 
     function playHls(url) {
+        playbackStarted = false;
         if (window.Hls && Hls.isSupported()) {
             if (hlsInstance) hlsInstance.destroy();
             hlsInstance = new Hls({
                 enableWorker: true,
-                backBufferLength: Infinity,
-                maxBufferLength: 30,
+                lowLatencyMode: false,
+                backBufferLength: 90,
+                maxBufferLength: 90,
                 maxMaxBufferLength: 600,
+                maxBufferSize: 120 * 1000 * 1000,
+                maxBufferHole: 0.5,
+                highBufferWatchdogPeriod: 3,
+                nudgeOffset: 0.1,
+                startFragPrefetch: true,
+                testBandwidth: false,
                 liveDurationInfinity: true,
+                liveSyncMode: 'buffered',
+                maxLiveSyncPlaybackRate: 1,
             });
             hlsInstance.loadSource(url);
             hlsInstance.attachMedia(player);
-            hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
-                loading.style.display = 'none';
-                player.play().catch(() => {});
+            const onBuffered = () => tryStartPlayback(HLS_START_BUFFER_SEC);
+            hlsInstance.on(Hls.Events.BUFFER_APPENDED, onBuffered);
+            hlsInstance.on(Hls.Events.FRAG_BUFFERED, onBuffered);
+            player.addEventListener('waiting', showBuffering);
+            player.addEventListener('playing', () => {
+                if (playbackStarted) loading.style.display = 'none';
             });
             hlsInstance.on(Hls.Events.ERROR, (_, data) => {
-                if (data.fatal) showError('Stream failed to load');
+                if (!data.fatal) {
+                    if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR) {
+                        showBuffering();
+                    }
+                    return;
+                }
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                    hlsInstance.recoverMediaError();
+                    return;
+                }
+                showError('Stream failed to load');
             });
+            setTimeout(() => {
+                if (!playbackStarted && bufferedAhead() > 0.5) tryStartPlayback(0.5);
+            }, 45000);
             return;
         }
         if (player.canPlayType('application/vnd.apple.mpegurl')) {
+            playbackStarted = false;
+            loading.style.display = 'flex';
+            loading.textContent = 'Loading...';
             player.src = url;
-            loading.style.display = 'none';
-            player.play().catch(() => {});
+            player.addEventListener('progress', () => tryStartPlayback(HLS_START_BUFFER_SEC));
+            player.addEventListener('waiting', showBuffering);
+            player.addEventListener('playing', () => {
+                if (playbackStarted) loading.style.display = 'none';
+            });
             return;
         }
         showError('HLS not supported in this browser');
     }
 
     async function startHlsStream() {
+        playbackStarted = false;
         const tvfile = new URLSearchParams(window.location.search).get('tvfile');
         loading.style.display = 'flex';
         loading.textContent = 'Preparing stream...';

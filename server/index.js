@@ -264,13 +264,37 @@ app.get('/hls/:streamId/index.m3u8', (req, res) => {
     }, 500);
 });
 
+function sendHlsSegment(res, segPath, segment) {
+    res.setHeader('Content-Type', segment.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.sendFile(segPath);
+}
+
 app.get('/hls/:streamId/:segment', (req, res) => {
     const { streamId, segment } = req.params;
     const segPath = path.join(HLS_TMP, streamId, segment);
-    if (!fs.existsSync(segPath)) return res.status(404).send('Segment not found');
-    res.setHeader('Content-Type', segment.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.sendFile(segPath);
+
+    if (fs.existsSync(segPath)) {
+        return sendHlsSegment(res, segPath, segment);
+    }
+
+    // Segment may still be encoding — wait briefly instead of 404-stalling the player
+    let attempts = 0;
+    const wait = setInterval(() => {
+        if (res.writableEnded) {
+            clearInterval(wait);
+            return;
+        }
+        if (fs.existsSync(segPath)) {
+            clearInterval(wait);
+            sendHlsSegment(res, segPath, segment);
+        } else if (++attempts > 40) {
+            clearInterval(wait);
+            res.status(404).send('Segment not found');
+        }
+    }, 250);
+    req.on('close', () => clearInterval(wait));
 });
 
 // Start HLS transcode
@@ -306,7 +330,7 @@ app.get('/start-stream', (req, res) => {
         ? (isMkv
             ? ['-c:v', 'copy']
             : ['-c:v', 'copy', '-bsf:v', 'h264_mp4toannexb'])
-        : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-g', '48', '-keyint_min', '48', '-sc_threshold', '0'];
+        : ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '23', '-threads', '0', '-g', '48', '-keyint_min', '48', '-sc_threshold', '0'];
 
     const audioLang = settings.preferredAudioLang || 'eng';
     let audioMap = ['-map', '0:a:0']; // default first audio
@@ -322,6 +346,8 @@ app.get('/start-stream', (req, res) => {
     } catch(e) {}
 
     const ffmpeg = spawn('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error',
+        '-probesize', '32M', '-analyzeduration', '10M',
         '-i', fullPath,
         '-map', '0:v:0',
         ...audioMap,
@@ -329,7 +355,7 @@ app.get('/start-stream', (req, res) => {
         '-c:a', 'aac',
         '-b:a', '192k',
         '-ac', '2',
-        '-hls_time', '2',
+        '-hls_time', '1',
         '-hls_list_size', '0',
         '-hls_playlist_type', 'event',
         '-hls_flags', 'independent_segments+append_list',
