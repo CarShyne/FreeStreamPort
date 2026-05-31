@@ -61,6 +61,10 @@
             font-size: 16px;
             background: #000;
         }
+        #loading.rebuffer {
+            pointer-events: none;
+            background: transparent;
+        }
         .player-btn {
             position: fixed;
             z-index: 999;
@@ -140,9 +144,12 @@
         return path.split('/').map(encodeURIComponent).join('/');
     }
 
-    const HLS_START_BUFFER_SEC = 10;
-    const MP4_START_BUFFER_SEC = 4;
+    const HLS_START_BUFFER_SEC = 6;
+    const MP4_START_BUFFER_SEC = 3;
     let playbackStarted = false;
+    let stallTimer = null;
+    let mediaRecoveries = 0;
+    let playerListenersBound = false;
 
     function bufferedAhead() {
         const ranges = player.buffered;
@@ -150,9 +157,23 @@
         return ranges.end(ranges.length - 1) - player.currentTime;
     }
 
-    function showBuffering() {
+    function showInitialLoading(text) {
+        loading.classList.remove('rebuffer');
+        loading.style.display = 'flex';
+        loading.textContent = text || 'Loading...';
+    }
+
+    function showRebuffering() {
+        if (!playbackStarted) return;
+        loading.classList.add('rebuffer');
         loading.style.display = 'flex';
         loading.textContent = 'Buffering...';
+    }
+
+    function hideLoading() {
+        loading.style.display = 'none';
+        loading.classList.remove('rebuffer');
+        clearTimeout(stallTimer);
     }
 
     function bufferTarget(minSeconds) {
@@ -165,26 +186,47 @@
 
     function tryStartPlayback(minSeconds) {
         if (playbackStarted) return;
-        if (bufferedAhead() >= bufferTarget(minSeconds)) {
+        if (bufferedAhead() >= bufferTarget(minSeconds) || player.readyState >= 3) {
             playbackStarted = true;
-            loading.style.display = 'none';
+            hideLoading();
             player.play().catch(() => {});
         }
     }
 
+    function scheduleStallRecovery() {
+        clearTimeout(stallTimer);
+        stallTimer = setTimeout(() => {
+            if (!playbackStarted || player.ended) return;
+            if (hlsInstance) hlsInstance.startLoad(-1);
+            if (player.paused) player.play().catch(() => {});
+        }, 2500);
+    }
+
+    function bindPlayerRecovery() {
+        if (playerListenersBound) return;
+        playerListenersBound = true;
+        player.addEventListener('waiting', () => {
+            showRebuffering();
+            scheduleStallRecovery();
+        });
+        player.addEventListener('stalled', scheduleStallRecovery);
+        player.addEventListener('canplay', hideLoading);
+        player.addEventListener('playing', hideLoading);
+    }
+
     function playDirect(url) {
         playbackStarted = false;
-        loading.textContent = 'Loading...';
-        loading.style.display = 'flex';
+        mediaRecoveries = 0;
+        showInitialLoading('Loading...');
         player.src = url;
+        bindPlayerRecovery();
         const onProgress = () => tryStartPlayback(MP4_START_BUFFER_SEC);
         player.addEventListener('progress', onProgress);
+        player.addEventListener('canplay', onProgress);
         player.addEventListener('canplaythrough', onProgress, { once: true });
-        player.addEventListener('loadedmetadata', onProgress, { once: true });
-        player.addEventListener('waiting', showBuffering);
-        player.addEventListener('playing', () => {
-            if (playbackStarted) loading.style.display = 'none';
-        });
+        setTimeout(() => {
+            if (!playbackStarted && player.readyState >= 2) tryStartPlayback(0.5);
+        }, 8000);
         player.addEventListener('error', () => {
             startHlsStream();
         }, { once: true });
@@ -192,61 +234,55 @@
 
     function playHls(url) {
         playbackStarted = false;
+        mediaRecoveries = 0;
         if (window.Hls && Hls.isSupported()) {
             if (hlsInstance) hlsInstance.destroy();
             hlsInstance = new Hls({
                 enableWorker: true,
-                lowLatencyMode: false,
-                backBufferLength: 90,
-                maxBufferLength: 90,
+                maxBufferLength: 60,
                 maxMaxBufferLength: 600,
-                maxBufferSize: 120 * 1000 * 1000,
-                maxBufferHole: 0.5,
-                highBufferWatchdogPeriod: 3,
-                nudgeOffset: 0.1,
+                maxBufferHole: 1,
                 startFragPrefetch: true,
-                testBandwidth: false,
-                liveDurationInfinity: true,
-                liveSyncMode: 'buffered',
-                maxLiveSyncPlaybackRate: 1,
             });
             hlsInstance.loadSource(url);
             hlsInstance.attachMedia(player);
+            bindPlayerRecovery();
+            showInitialLoading('Loading...');
+
             const onBuffered = () => tryStartPlayback(HLS_START_BUFFER_SEC);
             hlsInstance.on(Hls.Events.BUFFER_APPENDED, onBuffered);
             hlsInstance.on(Hls.Events.FRAG_BUFFERED, onBuffered);
-            player.addEventListener('waiting', showBuffering);
-            player.addEventListener('playing', () => {
-                if (playbackStarted) loading.style.display = 'none';
+            hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+                setTimeout(() => {
+                    if (!playbackStarted && bufferedAhead() > 0.5) tryStartPlayback(0.5);
+                }, 12000);
             });
+
             hlsInstance.on(Hls.Events.ERROR, (_, data) => {
-                if (!data.fatal) {
-                    if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR) {
-                        showBuffering();
-                    }
+                if (!data.fatal) return;
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < 1) {
+                    mediaRecoveries++;
+                    hlsInstance.recoverMediaError();
+                    scheduleStallRecovery();
                     return;
                 }
-                if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-                    hlsInstance.recoverMediaError();
+                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                    hlsInstance.startLoad();
                     return;
                 }
                 showError('Stream failed to load');
             });
-            setTimeout(() => {
-                if (!playbackStarted && bufferedAhead() > 0.5) tryStartPlayback(0.5);
-            }, 45000);
             return;
         }
         if (player.canPlayType('application/vnd.apple.mpegurl')) {
             playbackStarted = false;
-            loading.style.display = 'flex';
-            loading.textContent = 'Loading...';
+            showInitialLoading('Loading...');
+            bindPlayerRecovery();
             player.src = url;
             player.addEventListener('progress', () => tryStartPlayback(HLS_START_BUFFER_SEC));
-            player.addEventListener('waiting', showBuffering);
-            player.addEventListener('playing', () => {
-                if (playbackStarted) loading.style.display = 'none';
-            });
+            setTimeout(() => {
+                if (!playbackStarted) tryStartPlayback(0.5);
+            }, 12000);
             return;
         }
         showError('HLS not supported in this browser');
@@ -254,9 +290,9 @@
 
     async function startHlsStream() {
         playbackStarted = false;
+        mediaRecoveries = 0;
         const tvfile = new URLSearchParams(window.location.search).get('tvfile');
-        loading.style.display = 'flex';
-        loading.textContent = 'Preparing stream...';
+        showInitialLoading('Preparing stream...');
         player.removeAttribute('src');
         player.load();
 

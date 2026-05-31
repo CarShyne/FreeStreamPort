@@ -355,7 +355,7 @@ app.get('/start-stream', (req, res) => {
         '-c:a', 'aac',
         '-b:a', '192k',
         '-ac', '2',
-        '-hls_time', '1',
+        '-hls_time', '2',
         '-hls_list_size', '0',
         '-hls_playlist_type', 'event',
         '-hls_flags', 'independent_segments+append_list',
