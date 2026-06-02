@@ -6,7 +6,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const SETTINGS_FILE = path.join(__dirname, 'settings.json');
 
-export const APP_VERSION = '1.0.10';
+export const APP_VERSION = '1.0.11';
 
 const DEFAULTS = {
     mediaFolders: [process.env.MEDIA_FOLDER || "/media/movies"],

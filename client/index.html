@@ -414,7 +414,7 @@
         .settings-save-btn:hover { background:#33ddff; }
 
         #app-shell { min-height:100vh; }
-        body.login-required #app-shell { display:none; }
+        body.login-required #app-shell { display:none !important; }
         body:not(.login-required) #app-shell { animation:appReveal 0.4s ease; }
         @keyframes appReveal {
             from { opacity:0; }
@@ -580,7 +580,7 @@
 <div id="app-shell">
 
 <header>
-    <div class="logo">Free<span>Stream</span><span class="app-version">v1.0.10</span></div>
+    <div class="logo">Free<span>Stream</span><span class="app-version">v1.0.11</span></div>
     <nav class="main-nav">
         <button class="nav-btn active" onclick="setSection('movies', this)">Movies</button>
         <button class="nav-btn" onclick="setSection('tvshows', this)">TV Shows</button>
@@ -720,19 +720,13 @@
 </div><!-- /app-shell -->
 
 <div id="landing-page">
-    <img src="/landing.png" alt="FreeStream">
+    <img src="/landing.png?v=1.0.11" alt="">
 </div>
 
 <div id="login-modal">
     <div class="settings-overlay"></div>
     <div class="settings-card login-card">
-        <div class="settings-header" style="border-bottom:none;padding-bottom:0">
-            <div>
-                <div class="login-logo">Free<span style="color:rgba(0,212,255,0.5);font-weight:300">Stream</span></div>
-                <div class="login-tagline">Sign in to your library</div>
-            </div>
-        </div>
-        <div class="settings-body" style="padding-top:0">
+        <div class="settings-body" style="padding-top:16px">
             <form id="login-form" onsubmit="submitLogin(event)">
                 <div class="login-field">
                     <label for="login-user">Username</label>
