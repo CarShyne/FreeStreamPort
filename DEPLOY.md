@@ -16,11 +16,17 @@ If you still see **v1.0.4**, the server has not been redeployed since May 2026.
    docker compose -f docker-compose.portainer.yml build --no-cache
    docker compose -f docker-compose.portainer.yml up -d
    ```
-4. Add login env vars if not already set:
+4. Add login env vars if not already set. **Quote passwords** if they contain `#`, `$`, `!`, or spaces:
    ```yaml
-   - FREESTREAM_USER=admin
-   - FREESTREAM_PASSWORD=change-me
+   environment:
+     FREESTREAM_USER: admin
+     FREESTREAM_PASSWORD: "YourStr0ng!Pass#here"
    ```
+   Or use a file (avoids YAML/special-char issues) — mount a secret and set:
+   ```yaml
+   FREESTREAM_PASSWORD_FILE: /run/secrets/freestream_password
+   ```
+   After changing env vars you must **recreate** the container (restart alone is not enough).
 5. Hard-refresh the browser (Cmd+Shift+R).
 
 ## Option B — Docker Hub image (CI)

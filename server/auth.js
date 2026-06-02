@@ -1,7 +1,32 @@
 import crypto from 'crypto';
+import fs from 'fs';
 
-const AUTH_USER = process.env.FREESTREAM_USER || 'admin';
-const AUTH_PASSWORD = process.env.FREESTREAM_PASSWORD || 'admin';
+function readCredential(envKey, fileKey, defaultValue) {
+    const filePath = process.env[fileKey];
+    if (filePath) {
+        try {
+            const fromFile = fs.readFileSync(filePath, 'utf8').trim();
+            if (fromFile) return fromFile;
+        } catch (e) {
+            console.warn(`[auth] Could not read ${fileKey}:`, e.message);
+        }
+    }
+    const fromEnv = process.env[envKey];
+    if (fromEnv !== undefined && fromEnv !== '') return fromEnv.trim();
+    return defaultValue;
+}
+
+const AUTH_USER = readCredential('FREESTREAM_USER', 'FREESTREAM_USER_FILE', 'admin');
+const AUTH_PASSWORD = readCredential('FREESTREAM_PASSWORD', 'FREESTREAM_PASSWORD_FILE', 'admin');
+
+function safeEqual(a, b) {
+    const left = Buffer.from(String(a));
+    const right = Buffer.from(String(b));
+    if (left.length !== right.length) return false;
+    return crypto.timingSafeEqual(left, right);
+}
+
+console.log(`[auth] Login enabled for user "${AUTH_USER}" (set via env or *_FILE)`);
 const SESSION_COOKIE = 'freestream_session';
 const SESSION_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -23,7 +48,9 @@ export function getSessionToken(req) {
 }
 
 export function validateCredentials(username, password) {
-    return username === AUTH_USER && password === AUTH_PASSWORD;
+    const user = String(username ?? '').trim();
+    const pass = String(password ?? '');
+    return safeEqual(user, AUTH_USER) && safeEqual(pass, AUTH_PASSWORD);
 }
 
 export function createSession() {
