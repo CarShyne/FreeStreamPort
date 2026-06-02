@@ -24,6 +24,13 @@ app.post('/api/auth/logout', handleLogout);
 app.get('/api/auth/status', handleAuthStatus);
 app.use(authMiddleware);
 
+app.use((req, res, next) => {
+    if (req.path === '/' || req.path === '/index.html' || req.path === '/app.js') {
+        res.setHeader('Cache-Control', 'no-store');
+    }
+    next();
+});
+
 app.use(express.static(path.join(__dirname, '../client')));
 app.use('/vendor', express.static(path.join(__dirname, 'node_modules')));
 

@@ -413,10 +413,23 @@
         .settings-save-btn { background:#00d4ff; color:#000; border:none; border-radius:10px; padding:10px 24px; font-family:'Advent Pro',sans-serif; font-size:14px; font-weight:600; cursor:pointer; box-shadow:0 0 16px rgba(0,212,255,0.3); }
         .settings-save-btn:hover { background:#33ddff; }
 
-        #login-modal { position:fixed; inset:0; z-index:400; display:none; align-items:center; justify-content:center; }
-        #login-modal.open { display:flex; }
-        body.login-required header,
-        body.login-required .grid { filter:blur(6px); pointer-events:none; user-select:none; }
+        #app-shell { min-height:100vh; }
+        body.login-required #app-shell {
+            pointer-events:none;
+            user-select:none;
+            filter:blur(8px);
+        }
+        #login-modal {
+            position:fixed;
+            inset:0;
+            z-index:500;
+            display:none;
+            align-items:center;
+            justify-content:center;
+        }
+        body.login-required #login-modal { display:flex; }
+        #login-modal .settings-overlay { pointer-events:none; }
+        #login-modal .login-card { position:relative; z-index:2; pointer-events:auto; }
         .login-card { width:400px; animation:settingsIn 0.25s ease; }
         .login-logo { font-size:26px; font-weight:700; color:#00d4ff; text-shadow:0 0 20px rgba(0,212,255,0.5); margin-bottom:4px; }
         .login-tagline { font-size:13px; color:#666; font-weight:300; margin-bottom:20px; }
@@ -510,10 +523,12 @@
 ```
 
 </head>
-<body>
+<body class="login-required">
+
+<div id="app-shell">
 
 <header>
-    <div class="logo">Free<span>Stream</span><span class="app-version">v1.0.5</span></div>
+    <div class="logo">Free<span>Stream</span><span class="app-version">v1.0.6</span></div>
     <nav class="main-nav">
         <button class="nav-btn active" onclick="setSection('movies', this)">Movies</button>
         <button class="nav-btn" onclick="setSection('tvshows', this)">TV Shows</button>
@@ -542,35 +557,6 @@
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
     </button>
 </header>
-
-<!-- Login -->
-<div id="login-modal">
-    <div class="settings-overlay"></div>
-    <div class="settings-card login-card">
-        <div class="settings-header" style="border-bottom:none;padding-bottom:0">
-            <div>
-                <div class="login-logo">Free<span style="color:rgba(0,212,255,0.5);font-weight:300">Stream</span></div>
-                <div class="login-tagline">Sign in to your library</div>
-            </div>
-        </div>
-        <div class="settings-body" style="padding-top:0">
-            <form id="login-form" onsubmit="submitLogin(event)">
-                <div class="login-field">
-                    <label for="login-user">Username</label>
-                    <input class="settings-input" id="login-user" type="text" name="username" autocomplete="username" required>
-                </div>
-                <div class="login-field">
-                    <label for="login-pass">Password</label>
-                    <input class="settings-input" id="login-pass" type="password" name="password" autocomplete="current-password" required>
-                </div>
-                <p id="login-error" class="login-error"></p>
-            </form>
-        </div>
-        <div class="settings-footer">
-            <button type="submit" form="login-form" class="settings-save-btn" id="login-submit">Sign In</button>
-        </div>
-    </div>
-</div>
 
 <!-- Settings Modal -->
 <div id="settings-modal" style="display:none">
@@ -679,7 +665,37 @@
     </div>
 </div>
 
-<script src="app.js?v=1.0.5"></script>
+</div><!-- /app-shell -->
+
+<div id="login-modal">
+    <div class="settings-overlay"></div>
+    <div class="settings-card login-card">
+        <div class="settings-header" style="border-bottom:none;padding-bottom:0">
+            <div>
+                <div class="login-logo">Free<span style="color:rgba(0,212,255,0.5);font-weight:300">Stream</span></div>
+                <div class="login-tagline">Sign in to your library</div>
+            </div>
+        </div>
+        <div class="settings-body" style="padding-top:0">
+            <form id="login-form" onsubmit="submitLogin(event)">
+                <div class="login-field">
+                    <label for="login-user">Username</label>
+                    <input class="settings-input" id="login-user" type="text" name="username" autocomplete="username" required>
+                </div>
+                <div class="login-field">
+                    <label for="login-pass">Password</label>
+                    <input class="settings-input" id="login-pass" type="password" name="password" autocomplete="current-password" required>
+                </div>
+                <p id="login-error" class="login-error"></p>
+            </form>
+        </div>
+        <div class="settings-footer">
+            <button type="submit" form="login-form" class="settings-save-btn" id="login-submit">Sign In</button>
+        </div>
+    </div>
+</div>
+
+<script src="app.js?v=1.0.6"></script>
 
 </body>
 </html>

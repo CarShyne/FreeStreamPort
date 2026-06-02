@@ -1,31 +1,41 @@
 let allMovies = [];
 let currentMovie = null;
+let authenticated = false;
 
 const fetchOpts = { credentials: 'same-origin' };
 
 function showLogin() {
+    authenticated = false;
     document.body.classList.add('login-required');
-    document.getElementById('login-modal').classList.add('open');
     document.getElementById('logout-btn')?.classList.remove('visible');
+    document.getElementById('login-error').textContent = '';
     setTimeout(() => document.getElementById('login-user')?.focus(), 100);
 }
 
 function hideLogin() {
+    authenticated = true;
     document.body.classList.remove('login-required');
-    document.getElementById('login-modal').classList.remove('open');
     document.getElementById('logout-btn')?.classList.add('visible');
     document.getElementById('login-error').textContent = '';
 }
 
+function requireAuth() {
+    if (!authenticated) showLogin();
+    return authenticated;
+}
+
 async function initAuth() {
-    const res = await fetch('/api/auth/status', fetchOpts);
-    const { authenticated } = await res.json();
-    if (authenticated) {
-        hideLogin();
-        loadMovies();
-        return;
-    }
     showLogin();
+    try {
+        const res = await fetch('/api/auth/status', fetchOpts);
+        const data = await res.json();
+        if (data.authenticated) {
+            hideLogin();
+            loadMovies();
+        }
+    } catch {
+        document.getElementById('login-error').textContent = 'Could not reach server';
+    }
 }
 
 async function submitLogin(e) {
@@ -70,6 +80,7 @@ async function logout() {
 }
 
 async function loadMovies() {
+    if (!authenticated) return;
     const res = await fetch('/movies', fetchOpts);
     const data = await res.json();
     if (!res.ok) {
@@ -114,6 +125,7 @@ function renderGrid(movies) {
 }
 
 async function openModal(movie) {
+    if (!requireAuth()) return;
     currentMovie = movie;
     document.getElementById('m-poster').src = movie.poster || '';
     document.getElementById('m-poster').style.display = movie.poster ? 'block' : 'none';
@@ -151,6 +163,7 @@ async function openModal(movie) {
 }
 
 function playEpisode(show, episode) {
+    if (!requireAuth()) return;
     const file = encodeURIComponent(show + '/' + episode);
     window.open('/player.html?tvfile=' + file, '_blank');
 }
@@ -160,12 +173,12 @@ function closeModal() {
 }
 
 function playMovie() {
-    if (!currentMovie) return;
+    if (!requireAuth() || !currentMovie) return;
     window.open('/player.html?file=' + encodeURIComponent(currentMovie.filename), '_blank');
 }
 
 function downloadMovie() {
-    if (!currentMovie) return;
+    if (!requireAuth() || !currentMovie) return;
     const a = document.createElement('a');
     a.href = '/download?file=' + encodeURIComponent(currentMovie.filename);
     a.download = currentMovie.filename.split('/').pop();
@@ -175,6 +188,7 @@ function downloadMovie() {
 }
 
 document.getElementById('search').addEventListener('input', e => {
+    if (!authenticated) return;
     const q = e.target.value.toLowerCase();
     renderGrid(allMovies.filter(m => (m.title || m.filename).toLowerCase().includes(q)));
 });
@@ -183,9 +197,10 @@ document.addEventListener('keydown', e => {
     if (e.key === 'Escape') closeModal();
 });
 
-loadMovies();
+initAuth();
 
 async function setSection(section, btn) {
+    if (!requireAuth()) return;
     document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     if (section === 'tvshows') {
@@ -198,11 +213,13 @@ async function setSection(section, btn) {
 }
 
 function toggleSort(e) {
+    if (!requireAuth()) return;
     e.stopPropagation();
     document.getElementById('sort-dropdown').classList.toggle('open');
 }
 
 function selectSort(method, label) {
+    if (!requireAuth()) return;
     document.getElementById('sort-label').textContent = label;
     document.getElementById('sort-dropdown').classList.remove('open');
     document.querySelectorAll('.sort-option').forEach(o => o.classList.remove('active'));
@@ -231,6 +248,7 @@ function sortMovies(method) {
 
 // Settings
 async function openSettings() {
+    if (!requireAuth()) return;
     const res = await fetch('/api/settings', fetchOpts);
     const settings = await res.json();
 
