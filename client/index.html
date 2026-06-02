@@ -414,11 +414,37 @@
         .settings-save-btn:hover { background:#33ddff; }
 
         #app-shell { min-height:100vh; }
-        body.login-required #app-shell {
-            pointer-events:none;
-            user-select:none;
-            filter:blur(8px);
+        body.login-required #app-shell { display:none; }
+        body:not(.login-required) #app-shell { animation:appReveal 0.4s ease; }
+        @keyframes appReveal {
+            from { opacity:0; }
+            to { opacity:1; }
         }
+
+        #landing-page {
+            position:fixed;
+            inset:0;
+            z-index:300;
+            background:#0a0a0f;
+            overflow:hidden;
+        }
+        #landing-page img {
+            width:100%;
+            height:100%;
+            object-fit:cover;
+            object-position:center;
+            display:block;
+        }
+        #landing-page::after {
+            content:'';
+            position:absolute;
+            inset:0;
+            background:linear-gradient(to bottom, rgba(0,0,0,0.15) 0%, rgba(0,0,0,0.45) 100%);
+            pointer-events:none;
+        }
+        body.login-required #landing-page { display:block; }
+        body:not(.login-required) #landing-page { display:none; }
+
         #login-modal {
             position:fixed;
             inset:0;
@@ -426,10 +452,18 @@
             display:none;
             align-items:center;
             justify-content:center;
+            background:transparent;
         }
         body.login-required #login-modal { display:flex; }
-        #login-modal .settings-overlay { pointer-events:none; }
-        #login-modal .login-card { position:relative; z-index:2; pointer-events:auto; }
+        #login-modal .settings-overlay { display:none; }
+        #login-modal .login-card {
+            position:relative;
+            z-index:2;
+            pointer-events:auto;
+            background:rgba(17,17,24,0.92);
+            backdrop-filter:blur(16px);
+            box-shadow:0 0 80px rgba(0,0,0,0.6), 0 0 40px rgba(0,212,255,0.08);
+        }
         .login-card { width:400px; animation:settingsIn 0.25s ease; }
         .login-card .settings-header { justify-content:center; text-align:center; }
         .login-card .settings-body { padding:0 32px 8px; }
@@ -546,7 +580,7 @@
 <div id="app-shell">
 
 <header>
-    <div class="logo">Free<span>Stream</span><span class="app-version">v1.0.9</span></div>
+    <div class="logo">Free<span>Stream</span><span class="app-version">v1.0.10</span></div>
     <nav class="main-nav">
         <button class="nav-btn active" onclick="setSection('movies', this)">Movies</button>
         <button class="nav-btn" onclick="setSection('tvshows', this)">TV Shows</button>
@@ -684,6 +718,10 @@
 </div>
 
 </div><!-- /app-shell -->
+
+<div id="landing-page">
+    <img src="/landing.png" alt="FreeStream">
+</div>
 
 <div id="login-modal">
     <div class="settings-overlay"></div>
