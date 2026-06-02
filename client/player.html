@@ -103,6 +103,16 @@
 </div>
 <script src="/vendor/hls.js/dist/hls.min.js"></script>
 <script>
+    async function ensureAuth() {
+        const res = await fetch('/api/auth/status', { credentials: 'same-origin' });
+        const { authenticated } = await res.json();
+        if (!authenticated) {
+            window.location.replace('/');
+            return false;
+        }
+        return true;
+    }
+
     const file = new URLSearchParams(window.location.search).get('file');
     const loading = document.getElementById('loading');
     const player = document.getElementById('player');
@@ -342,7 +352,7 @@
 
     applyFitMode();
     showControls();
-    startStream();
+    ensureAuth().then(ok => { if (ok) startStream(); });
 
     // Fullscreen helps tab/screen cast fill the TV instead of mirroring a small window
     enterFullscreen().catch(() => {});

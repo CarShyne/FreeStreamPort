@@ -6,12 +6,24 @@ import { exec, spawn, execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import fetch from 'node-fetch';
 import { loadSettings, saveSettings, APP_VERSION } from './settings.js';
+import {
+    authMiddleware,
+    handleLogin,
+    handleLogout,
+    handleAuthStatus,
+} from './auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
+
+app.post('/api/auth/login', express.json(), handleLogin);
+app.post('/api/auth/logout', handleLogout);
+app.get('/api/auth/status', handleAuthStatus);
+app.use(authMiddleware);
+
 app.use(express.static(path.join(__dirname, '../client')));
 app.use('/vendor', express.static(path.join(__dirname, 'node_modules')));
 

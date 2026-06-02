@@ -1,8 +1,76 @@
 let allMovies = [];
 let currentMovie = null;
 
+const fetchOpts = { credentials: 'same-origin' };
+
+function showLogin() {
+    document.body.classList.add('login-required');
+    document.getElementById('login-modal').classList.add('open');
+    document.getElementById('logout-btn')?.classList.remove('visible');
+    setTimeout(() => document.getElementById('login-user')?.focus(), 100);
+}
+
+function hideLogin() {
+    document.body.classList.remove('login-required');
+    document.getElementById('login-modal').classList.remove('open');
+    document.getElementById('logout-btn')?.classList.add('visible');
+    document.getElementById('login-error').textContent = '';
+}
+
+async function initAuth() {
+    const res = await fetch('/api/auth/status', fetchOpts);
+    const { authenticated } = await res.json();
+    if (authenticated) {
+        hideLogin();
+        loadMovies();
+        return;
+    }
+    showLogin();
+}
+
+async function submitLogin(e) {
+    e.preventDefault();
+    const username = document.getElementById('login-user').value.trim();
+    const password = document.getElementById('login-pass').value;
+    const errEl = document.getElementById('login-error');
+    const btn = document.getElementById('login-submit');
+    errEl.textContent = '';
+    btn.disabled = true;
+    btn.textContent = 'Signing in...';
+
+    try {
+        const res = await fetch('/api/auth/login', {
+            ...fetchOpts,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            errEl.textContent = data.error || 'Sign in failed';
+            return;
+        }
+        hideLogin();
+        loadMovies();
+    } catch {
+        errEl.textContent = 'Could not reach server';
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Sign In';
+    }
+}
+
+async function logout() {
+    await fetch('/api/auth/logout', { ...fetchOpts, method: 'POST' });
+    allMovies = [];
+    currentMovies = [];
+    document.getElementById('grid').innerHTML = '';
+    document.getElementById('login-pass').value = '';
+    showLogin();
+}
+
 async function loadMovies() {
-    const res = await fetch('/movies');
+    const res = await fetch('/movies', fetchOpts);
     const data = await res.json();
     if (!res.ok) {
         const grid = document.getElementById('grid');
@@ -56,7 +124,7 @@ async function openModal(movie) {
 
     const actions = document.querySelector('.modal-actions');
     if (movie.type === 'tv') {
-        const res = await fetch('/tvshows/episodes?show=' + encodeURIComponent(movie.showName));
+        const res = await fetch('/tvshows/episodes?show=' + encodeURIComponent(movie.showName), fetchOpts);
         const episodes = await res.json();
         actions.innerHTML = '<div style="display:flex;flex-direction:column;gap:6px;width:100%;max-height:200px;overflow-y:auto;padding-right:4px;">' +
             episodes.map(ep => `<button onclick="playEpisode('${movie.showName.replace(/'/g,"\'")}','${ep.file.replace(/'/g,"\'")}')"
@@ -121,7 +189,7 @@ async function setSection(section, btn) {
     document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     if (section === 'tvshows') {
-        const res = await fetch('/tvshows');
+        const res = await fetch('/tvshows', fetchOpts);
         const shows = await res.json();
         renderGrid(shows);
     } else {
@@ -163,7 +231,7 @@ function sortMovies(method) {
 
 // Settings
 async function openSettings() {
-    const res = await fetch('/api/settings');
+    const res = await fetch('/api/settings', fetchOpts);
     const settings = await res.json();
 
     // Populate folders
@@ -203,7 +271,7 @@ function addFolderRow(value = '') {
 
 async function addFolder() {
     try {
-        const res = await fetch('/pick-folder');
+        const res = await fetch('/pick-folder', fetchOpts);
         const { path } = await res.json();
         addFolderRow(path || '');
     } catch(e) {
@@ -224,9 +292,10 @@ async function saveSettings() {
     };
 
     await fetch('/api/settings', {
+        ...fetchOpts,
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(settings)
+        body: JSON.stringify(settings),
     });
 
     closeSettings();
