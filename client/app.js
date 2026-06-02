@@ -49,11 +49,12 @@ async function submitLogin(e) {
     btn.textContent = 'Signing in...';
 
     try {
+        const remember = document.getElementById('login-remember')?.checked ?? true;
         const res = await fetch('/api/auth/login', {
             ...fetchOpts,
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username, password }),
+            body: JSON.stringify({ username, password, remember }),
         });
         const data = await res.json();
         if (!res.ok) {

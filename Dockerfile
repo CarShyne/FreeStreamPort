@@ -18,7 +18,7 @@ RUN cd server && npm install --production
 COPY server/ ./server/
 COPY client/ ./client/
 
-RUN mkdir -p /tmp/freestream-hls
+RUN mkdir -p /tmp/freestream-hls /data
 
 EXPOSE 3000
 

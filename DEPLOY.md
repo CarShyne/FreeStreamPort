@@ -27,6 +27,29 @@ If you still see **v1.0.4**, the server has not been redeployed since May 2026.
    FREESTREAM_PASSWORD_FILE: /run/secrets/freestream_password
    ```
    After changing env vars you must **recreate** the container (restart alone is not enough).
+
+## Multiple users
+
+Create a JSON file (see `server/users.example.json`):
+
+```json
+{
+  "admin": "YourAdmin@Pass",
+  "family": "AnotherPass"
+}
+```
+
+Mount it and set `FREESTREAM_USERS_FILE=/data/users.json` (quote passwords with `@` in the JSON file — no YAML issues).
+
+Or set `FREESTREAM_USERS` as a single-line JSON string in Portainer.
+
+## Persistent logins (“keep me signed in”)
+
+Sessions are saved to `FREESTREAM_DATA_DIR` (default `server/data`, Docker: mount volume at `/data`).
+
+- Checked on login → **90 days** on that device  
+- Unchecked → **7 days**  
+- Survives container restarts when the data volume is mounted  
 5. Hard-refresh the browser (Cmd+Shift+R).
 
 ## Option B — Docker Hub image (CI)

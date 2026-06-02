@@ -17,14 +17,19 @@ services:
       - /srv/dev-disk-by-uuid-ef6d3ece-2b16-4ae0-bda5-3c5fe4d26ebc/2TB/Movies.2TB:/media/movies
       - /srv/dev-disk-by-uuid-ef6d3ece-2b16-4ae0-bda5-3c5fe4d26ebc/2TB/Movies.2TB/Tv Shows:/media/Tv
       - freestream-hls:/tmp/freestream-hls
+      - freestream-data:/data
     environment:
       MEDIA_FOLDER: /media/movies
       TV_FOLDER: /media/Tv
       PORT: "3000"
       TMDB_API_KEY: "866794356a9e7ac61771ae56bd99e284"
       FREESTREAM_USER: admin
-      # Quote passwords with special characters (# $ ! etc.)
+      # Quote passwords with special characters (@ # $ ! etc.)
       FREESTREAM_PASSWORD: "admin"
+      # Multiple users — copy server/users.example.json to a volume path and set:
+      # FREESTREAM_USERS_FILE: /data/users.json
+      FREESTREAM_DATA_DIR: /data
 
 volumes:
   freestream-hls:
+  freestream-data:

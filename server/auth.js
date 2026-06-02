@@ -1,5 +1,18 @@
 import crypto from 'crypto';
 import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const SESSION_COOKIE = 'freestream_session';
+const SESSION_MS = (parseInt(process.env.FREESTREAM_SESSION_DAYS, 10) || 7) * 24 * 60 * 60 * 1000;
+const REMEMBER_MS = (parseInt(process.env.FREESTREAM_REMEMBER_DAYS, 10) || 90) * 24 * 60 * 60 * 1000;
+const DATA_DIR = process.env.FREESTREAM_DATA_DIR || path.join(__dirname, 'data');
+const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
+
+const sessions = new Map();
+let saveTimer = null;
 
 function readCredential(envKey, fileKey, defaultValue) {
     const filePath = process.env[fileKey];
@@ -16,8 +29,60 @@ function readCredential(envKey, fileKey, defaultValue) {
     return defaultValue;
 }
 
-const AUTH_USER = readCredential('FREESTREAM_USER', 'FREESTREAM_USER_FILE', 'admin');
-const AUTH_PASSWORD = readCredential('FREESTREAM_PASSWORD', 'FREESTREAM_PASSWORD_FILE', 'admin');
+function loadUsers() {
+    const usersFile = process.env.FREESTREAM_USERS_FILE;
+    if (usersFile) {
+        try {
+            const parsed = JSON.parse(fs.readFileSync(usersFile, 'utf8'));
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                return normalizeUsers(parsed);
+            }
+            console.warn('[auth] FREESTREAM_USERS_FILE must be a JSON object { "user": "password" }');
+        } catch (e) {
+            console.warn('[auth] Could not read FREESTREAM_USERS_FILE:', e.message);
+        }
+    }
+
+    const usersJson = process.env.FREESTREAM_USERS;
+    if (usersJson) {
+        try {
+            const parsed = JSON.parse(usersJson);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                return normalizeUsers(parsed);
+            }
+            console.warn('[auth] FREESTREAM_USERS must be JSON object { "user": "password" }');
+        } catch (e) {
+            console.warn('[auth] Could not parse FREESTREAM_USERS:', e.message);
+        }
+    }
+
+    const user = readCredential('FREESTREAM_USER', 'FREESTREAM_USER_FILE', 'admin');
+    const pass = readCredential('FREESTREAM_PASSWORD', 'FREESTREAM_PASSWORD_FILE', 'admin');
+    return { [user]: pass };
+}
+
+function normalizeUsers(obj) {
+    const users = {};
+    for (const [name, pass] of Object.entries(obj)) {
+        const key = String(name).trim();
+        if (key && pass != null && String(pass) !== '') {
+            users[key] = String(pass);
+        }
+    }
+    return users;
+}
+
+const USERS = loadUsers();
+const USER_NAMES = Object.keys(USERS);
+
+if (!USER_NAMES.length) {
+    console.error('[auth] No users configured — set FREESTREAM_USERS, FREESTREAM_USERS_FILE, or FREESTREAM_USER/PASSWORD');
+    USERS.admin = 'admin';
+    USER_NAMES.push('admin');
+}
+
+console.log(`[auth] ${USER_NAMES.length} user(s): ${USER_NAMES.join(', ')}`);
+console.log(`[auth] Sessions stored in ${SESSIONS_FILE}`);
 
 function safeEqual(a, b) {
     const left = Buffer.from(String(a));
@@ -26,11 +91,57 @@ function safeEqual(a, b) {
     return crypto.timingSafeEqual(left, right);
 }
 
-console.log(`[auth] Login enabled for user "${AUTH_USER}" (set via env or *_FILE)`);
-const SESSION_COOKIE = 'freestream_session';
-const SESSION_MS = 7 * 24 * 60 * 60 * 1000;
+function ensureDataDir() {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
-const sessions = new Map();
+function loadSessionsFromDisk() {
+    ensureDataDir();
+    if (!fs.existsSync(SESSIONS_FILE)) return;
+    try {
+        const raw = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+        const now = Date.now();
+        let loaded = 0;
+        for (const [token, session] of Object.entries(raw)) {
+            if (!session?.user || !session?.expires) continue;
+            if (session.expires <= now) continue;
+            sessions.set(token, {
+                user: session.user,
+                expires: session.expires,
+                remember: Boolean(session.remember),
+                created: session.created || now,
+            });
+            loaded++;
+        }
+        console.log(`[auth] Restored ${loaded} active session(s)`);
+        if (loaded < Object.keys(raw).length) scheduleSave();
+    } catch (e) {
+        console.warn('[auth] Could not load sessions file:', e.message);
+    }
+}
+
+function saveSessionsToDisk() {
+    ensureDataDir();
+    const now = Date.now();
+    const out = {};
+    for (const [token, session] of sessions.entries()) {
+        if (session.expires <= now) continue;
+        out[token] = {
+            user: session.user,
+            expires: session.expires,
+            remember: session.remember,
+            created: session.created,
+        };
+    }
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(out, null, 2));
+}
+
+function scheduleSave() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(saveSessionsToDisk, 400);
+}
+
+loadSessionsFromDisk();
 
 function parseCookies(header) {
     const cookies = {};
@@ -47,38 +158,56 @@ export function getSessionToken(req) {
     return parseCookies(req.headers.cookie)[SESSION_COOKIE] || null;
 }
 
-export function validateCredentials(username, password) {
+function findUser(username, password) {
     const user = String(username ?? '').trim();
     const pass = String(password ?? '');
-    return safeEqual(user, AUTH_USER) && safeEqual(pass, AUTH_PASSWORD);
+    if (!user || !USERS[user]) return null;
+    if (!safeEqual(pass, USERS[user])) return null;
+    return user;
 }
 
-export function createSession() {
+export function validateCredentials(username, password) {
+    return findUser(username, password) !== null;
+}
+
+export function createSession(username, remember = false) {
     const token = crypto.randomBytes(32).toString('hex');
-    sessions.set(token, { user: AUTH_USER, expires: Date.now() + SESSION_MS });
-    return token;
+    const ttl = remember ? REMEMBER_MS : SESSION_MS;
+    const now = Date.now();
+    sessions.set(token, {
+        user: username,
+        expires: now + ttl,
+        remember,
+        created: now,
+    });
+    scheduleSave();
+    return { token, maxAgeSec: Math.floor(ttl / 1000) };
+}
+
+export function getSession(token) {
+    if (!token) return null;
+    const session = sessions.get(token);
+    if (!session) return null;
+    if (Date.now() > session.expires) {
+        sessions.delete(token);
+        scheduleSave();
+        return null;
+    }
+    return session;
 }
 
 export function validateSession(token) {
-    if (!token) return false;
-    const session = sessions.get(token);
-    if (!session) return false;
-    if (Date.now() > session.expires) {
-        sessions.delete(token);
-        return false;
-    }
-    return true;
+    return getSession(token) !== null;
 }
 
 export function destroySession(token) {
-    if (token) sessions.delete(token);
+    if (token && sessions.delete(token)) scheduleSave();
 }
 
-function setSessionCookie(res, token) {
-    const maxAge = Math.floor(SESSION_MS / 1000);
+function setSessionCookie(res, token, maxAgeSec) {
     res.setHeader(
         'Set-Cookie',
-        `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`
+        `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSec}`
     );
 }
 
@@ -115,13 +244,14 @@ export function authMiddleware(req, res, next) {
 }
 
 export function handleLogin(req, res) {
-    const { username, password } = req.body || {};
-    if (!validateCredentials(username, password)) {
+    const { username, password, remember } = req.body || {};
+    const user = findUser(username, password);
+    if (!user) {
         return res.status(401).json({ error: 'Invalid username or password', authenticated: false });
     }
-    const token = createSession();
-    setSessionCookie(res, token);
-    res.json({ ok: true, authenticated: true, user: AUTH_USER });
+    const { token, maxAgeSec } = createSession(user, Boolean(remember));
+    setSessionCookie(res, token, maxAgeSec);
+    res.json({ ok: true, authenticated: true, user, remember: Boolean(remember) });
 }
 
 export function handleLogout(req, res) {
@@ -131,6 +261,10 @@ export function handleLogout(req, res) {
 }
 
 export function handleAuthStatus(req, res) {
-    const authenticated = validateSession(getSessionToken(req));
-    res.json({ authenticated, user: authenticated ? AUTH_USER : null });
+    const session = getSession(getSessionToken(req));
+    res.json({
+        authenticated: Boolean(session),
+        user: session?.user ?? null,
+        remember: session?.remember ?? false,
+    });
 }
