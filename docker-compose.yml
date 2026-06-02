@@ -18,4 +18,4 @@ services:
       - PORT=3000
       - TMDB_API_KEY=866794356a9e7ac61771ae56bd99e284
       - FREESTREAM_USER=admin
-      - FREESTREAM_PASSWORD=admin
+      - FREESTREAM_PASSWORD=xxxx
