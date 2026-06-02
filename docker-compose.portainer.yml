@@ -6,6 +6,7 @@ version: '3.8'
 
 services:
   freestream:
+    build: .
     image: jt7777/freestream:latest
     container_name: freestream
     restart: unless-stopped
