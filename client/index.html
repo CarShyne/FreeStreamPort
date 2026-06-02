@@ -431,11 +431,17 @@
         #login-modal .settings-overlay { pointer-events:none; }
         #login-modal .login-card { position:relative; z-index:2; pointer-events:auto; }
         .login-card { width:400px; animation:settingsIn 0.25s ease; }
+        .login-card .settings-header { justify-content:center; text-align:center; }
+        .login-card .settings-body { padding:0 32px 8px; }
+        .login-card .settings-footer { justify-content:center; }
+        #login-form { width:100%; max-width:300px; margin:0 auto; }
         .login-logo { font-size:26px; font-weight:700; color:#00d4ff; text-shadow:0 0 20px rgba(0,212,255,0.5); margin-bottom:4px; }
         .login-tagline { font-size:13px; color:#666; font-weight:300; margin-bottom:20px; }
-        .login-error { font-size:13px; color:#ff6b6b; margin-top:8px; min-height:18px; }
-        .login-field { margin-bottom:14px; }
+        .login-error { font-size:13px; color:#ff6b6b; margin-top:8px; min-height:18px; text-align:center; }
+        .login-field { margin-bottom:14px; text-align:center; }
         .login-field label { display:block; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.8px; color:#00d4ff; margin-bottom:6px; }
+        .login-field .settings-input { width:100%; flex:none; display:block; margin:0 auto; text-align:center; }
+        .login-field .settings-input::placeholder { text-align:center; }
         .logout-btn { background:none; border:none; color:#666; cursor:pointer; padding:6px; border-radius:8px; display:none; align-items:center; transition:color 0.15s, background 0.15s; flex-shrink:0; }
         .logout-btn.visible { display:flex; }
         .logout-btn:hover { color:#ff6b6b; background:rgba(255,107,107,0.1); }
@@ -528,7 +534,7 @@
 <div id="app-shell">
 
 <header>
-    <div class="logo">Free<span>Stream</span><span class="app-version">v1.0.6</span></div>
+    <div class="logo">Free<span>Stream</span><span class="app-version">v1.0.7</span></div>
     <nav class="main-nav">
         <button class="nav-btn active" onclick="setSection('movies', this)">Movies</button>
         <button class="nav-btn" onclick="setSection('tvshows', this)">TV Shows</button>
@@ -695,7 +701,7 @@
     </div>
 </div>
 
-<script src="app.js?v=1.0.6"></script>
+<script src="app.js?v=1.0.7"></script>
 
 </body>
 </html>
