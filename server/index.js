@@ -684,22 +684,16 @@ app.get('/start-stream', async (req, res) => {
     const isMkv = target.toLowerCase().endsWith('.mkv');
 
     const inputCodec = probeVideoCodec(fullPath);
-    console.log('Input codec:', inputCodec, 'encoder:', videoEncoderLabel, 'for', fullPath);
-
-    // H.264 can be remuxed to fragmented MP4 — much smoother than live HLS
-    if (inputCodec === 'h264' && req.query.forceHls !== '1') {
-        const q = tvfile
-            ? `tvfile=${encodeURIComponent(tvfile)}`
-            : `file=${encodeURIComponent(file)}`;
-        return res.json({ mode: 'remux', url: `/stream-remux?${q}` });
-    }
+    const isCopyMode = inputCodec === 'h264';
+    console.log('Input codec:', inputCodec, 'encoder:', videoEncoderLabel, 'copyMode:', isCopyMode, 'for', fullPath);
 
     const videoArgs = buildVideoArgs(inputCodec, isMkv);
     const audioMap = getAudioMap(fullPath, settings);
+    const headStartTarget = isCopyMode ? 6 : HLS_HEAD_START_SEGMENTS;
 
-    const ffmpeg = spawn('ffmpeg', [
+    const ffmpegArgs = [
         '-hide_banner', '-loglevel', 'error',
-        ...buildDecodeArgs(),
+        ...buildDecodeArgs(isCopyMode ? null : hwEncoder),
         '-probesize', '32M', '-analyzeduration', '10M',
         '-i', fullPath,
         '-map', '0:v:0',
@@ -709,14 +703,22 @@ app.get('/start-stream', async (req, res) => {
         '-b:a', '192k',
         '-ac', '2',
         '-max_muxing_queue_size', '9999',
+    ];
+
+    if (!isCopyMode) {
+        ffmpegArgs.push('-force_key_frames', `expr:gte(t,n_forced*${HLS_SEGMENT_SEC})`);
+    }
+
+    ffmpegArgs.push(
         '-hls_time', String(HLS_SEGMENT_SEC),
         '-hls_list_size', '0',
         '-hls_playlist_type', 'event',
         '-hls_flags', 'independent_segments+append_list',
-        '-force_key_frames', `expr:gte(t,n_forced*${HLS_SEGMENT_SEC})`,
         '-hls_segment_filename', path.join(outDir, 'seg%03d.ts'),
         path.join(outDir, 'index.m3u8')
-    ], { stdio: ['ignore', 'ignore', 'pipe'] });
+    );
+
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
 
     activeStreams[streamId] = ffmpeg;
     console.log('Starting FFmpeg HLS for:', fullPath);
@@ -725,11 +727,11 @@ app.get('/start-stream', async (req, res) => {
     ffmpeg.on('close', () => delete activeStreams[streamId]);
 
     // Let FFmpeg build a head-start buffer before the player begins consuming
-    const headStart = await waitForHeadStart(outDir, HLS_HEAD_START_SEGMENTS, 90000);
+    const headStart = await waitForHeadStart(outDir, headStartTarget, isCopyMode ? 30000 : 90000);
     if (!headStart) {
         console.warn('[HLS] Head-start timeout for', streamId, '- starting with', countHlsSegments(outDir), 'segments');
     } else {
-        console.log('[HLS] Head-start ready:', countHlsSegments(outDir), 'segments for', streamId);
+        console.log('[HLS] Head-start ready:', countHlsSegments(outDir), 'segments for', streamId, isCopyMode ? '(copy)' : '(transcode)');
     }
 
     res.json({
@@ -737,6 +739,7 @@ app.get('/start-stream', async (req, res) => {
         streamId,
         url: `/hls/${streamId}/index.m3u8`,
         encodedSeconds: getEncodedDuration(outDir),
+        copyMode: isCopyMode,
     });
 });
 

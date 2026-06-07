@@ -155,10 +155,14 @@
     }
 
     const HLS_START_BUFFER_SEC = 20;
+    const HLS_START_BUFFER_COPY_SEC = 8;
     const MP4_START_BUFFER_SEC = 5;
     const HLS_MIN_PLAY_BUFFER_SEC = 8;
+    const HLS_MIN_PLAY_COPY_SEC = 4;
     const HLS_RESUME_BUFFER_SEC = 20;
+    const HLS_RESUME_COPY_SEC = 10;
     const HLS_ENCODE_LEAD_SEC = 12;
+    const HLS_ENCODE_LEAD_COPY_SEC = 6;
     let playbackStarted = false;
     let stallTimer = null;
     let bufferWatchdog = null;
@@ -168,6 +172,24 @@
     let pausedForBuffer = false;
     let hlsStreamId = null;
     let encodedAheadSec = Infinity;
+    let hlsCopyMode = false;
+    let usingNativeHls = false;
+
+    function hlsStartBufferSec() {
+        return hlsCopyMode ? HLS_START_BUFFER_COPY_SEC : HLS_START_BUFFER_SEC;
+    }
+
+    function hlsMinPlayBufferSec() {
+        return hlsCopyMode ? HLS_MIN_PLAY_COPY_SEC : HLS_MIN_PLAY_BUFFER_SEC;
+    }
+
+    function hlsResumeBufferSec() {
+        return hlsCopyMode ? HLS_RESUME_COPY_SEC : HLS_RESUME_BUFFER_SEC;
+    }
+
+    function hlsEncodeLeadSec() {
+        return hlsCopyMode ? HLS_ENCODE_LEAD_COPY_SEC : HLS_ENCODE_LEAD_SEC;
+    }
 
     function bufferedAhead() {
         const ranges = player.buffered;
@@ -224,7 +246,7 @@
         if (bufferWatchdog) clearInterval(bufferWatchdog);
         bufferWatchdog = setInterval(() => {
             if (!playbackStarted || player.ended || player.seeking) return;
-            if (hlsInstance && needsBufferPause() && !player.paused) {
+            if ((hlsInstance || usingNativeHls) && needsBufferPause() && !player.paused) {
                 pausedForBuffer = true;
                 player.pause();
                 showRebuffering();
@@ -248,6 +270,8 @@
         pausedForBuffer = false;
         encodedAheadSec = Infinity;
         hlsStreamId = null;
+        hlsCopyMode = false;
+        usingNativeHls = false;
     }
 
     async function pollEncodeLead() {
@@ -267,16 +291,16 @@
     }
 
     function needsBufferPause() {
-        if (!hlsInstance) return false;
+        if (!hlsInstance && !usingNativeHls) return false;
         const ahead = bufferedAhead();
-        if (ahead < HLS_MIN_PLAY_BUFFER_SEC) return true;
-        if (encodedAheadSec < HLS_ENCODE_LEAD_SEC) return true;
+        if (ahead < hlsMinPlayBufferSec()) return true;
+        if (hlsStreamId && encodedAheadSec < hlsEncodeLeadSec()) return true;
         return false;
     }
 
     function canResumeFromBuffer() {
-        return bufferedAhead() >= HLS_RESUME_BUFFER_SEC
-            && encodedAheadSec >= HLS_ENCODE_LEAD_SEC;
+        return bufferedAhead() >= hlsResumeBufferSec()
+            && (!hlsStreamId || encodedAheadSec >= hlsEncodeLeadSec());
     }
 
     function bindPlayerRecovery() {
@@ -290,8 +314,6 @@
         player.addEventListener('canplay', () => { if (!pausedForBuffer) hideLoading(); });
         player.addEventListener('playing', () => { if (!pausedForBuffer) hideLoading(); });
     }
-
-    let remuxFailed = false;
 
     function playDirect(url, onErrorFallback) {
         playbackStarted = false;
@@ -312,11 +334,13 @@
         }, { once: true });
     }
 
-    function playHls(url, streamId) {
+    function playHls(url, streamId, copyMode) {
         playbackStarted = false;
         mediaRecoveries = 0;
         hlsStreamId = streamId || null;
+        hlsCopyMode = Boolean(copyMode);
         encodedAheadSec = Infinity;
+        usingNativeHls = false;
         if (window.Hls && Hls.isSupported()) {
             if (hlsInstance) hlsInstance.destroy();
             hlsInstance = new Hls({
@@ -341,7 +365,7 @@
             if (hlsStreamId) startEncodeLeadWatch();
             showInitialLoading('Loading...');
 
-            const onBuffered = () => tryStartPlayback(HLS_START_BUFFER_SEC);
+            const onBuffered = () => tryStartPlayback(hlsStartBufferSec());
             hlsInstance.on(Hls.Events.BUFFER_APPENDED, onBuffered);
             hlsInstance.on(Hls.Events.FRAG_BUFFERED, onBuffered);
             hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -367,20 +391,26 @@
             return;
         }
         if (player.canPlayType('application/vnd.apple.mpegurl')) {
+            usingNativeHls = true;
             playbackStarted = false;
             showInitialLoading('Loading...');
             bindPlayerRecovery();
+            startBufferWatchdog();
+            if (hlsStreamId) startEncodeLeadWatch();
             player.src = url;
-            player.addEventListener('progress', () => tryStartPlayback(HLS_START_BUFFER_SEC));
+            const onProgress = () => tryStartPlayback(hlsStartBufferSec());
+            player.addEventListener('progress', onProgress);
+            player.addEventListener('canplay', onProgress);
+            player.addEventListener('canplaythrough', onProgress, { once: true });
             setTimeout(() => {
-                if (!playbackStarted) tryStartPlayback(0.5);
+                if (!playbackStarted && player.readyState >= 2) tryStartPlayback(0.5);
             }, 12000);
             return;
         }
         showError('HLS not supported in this browser');
     }
 
-    async function startHlsStream(forceHls = false) {
+    async function startHlsStream() {
         playbackStarted = false;
         mediaRecoveries = 0;
         stopBufferWatchdog();
@@ -389,28 +419,16 @@
         player.removeAttribute('src');
         player.load();
 
-        const base = tvfile
+        const endpoint = tvfile
             ? '/start-stream?tvfile=' + encodeURIComponent(tvfile)
             : '/start-stream?file=' + encodeURIComponent(file);
-        const endpoint = forceHls ? base + '&forceHls=1' : base;
         const res = await fetch(endpoint);
         if (!res.ok) {
             showError('Could not start stream');
             return;
         }
         const data = await res.json();
-        if (data.mode === 'remux') {
-            playDirect(data.url, () => {
-                if (!remuxFailed) {
-                    remuxFailed = true;
-                    startHlsStream(true);
-                } else {
-                    showError('Stream failed to load');
-                }
-            });
-            return;
-        }
-        playHls(data.url, data.streamId);
+        playHls(data.url, data.streamId, data.copyMode);
     }
 
     async function startStream() {
@@ -425,7 +443,7 @@
             const url = tvfile
                 ? '/tv-media/' + mediaUrl(tvfile)
                 : '/stream-mp4?file=' + encodeURIComponent(file);
-            playDirect(url, () => startHlsStream(true));
+            playDirect(url, () => startHlsStream());
             return;
         }
 
