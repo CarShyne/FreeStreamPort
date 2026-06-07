@@ -3,6 +3,8 @@ FROM node:20-slim
 # Install FFmpeg and Python
 RUN apt-get update && apt-get install -y \
     ffmpeg \
+    libv4l-0 \
+    v4l-utils \
     python3 \
     python3-pip \
     curl \

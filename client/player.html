@@ -154,16 +154,20 @@
         return path.split('/').map(encodeURIComponent).join('/');
     }
 
-    const HLS_START_BUFFER_SEC = 12;
-    const MP4_START_BUFFER_SEC = 3;
-    const HLS_MIN_PLAY_BUFFER_SEC = 4;
-    const HLS_RESUME_BUFFER_SEC = 10;
+    const HLS_START_BUFFER_SEC = 20;
+    const MP4_START_BUFFER_SEC = 5;
+    const HLS_MIN_PLAY_BUFFER_SEC = 8;
+    const HLS_RESUME_BUFFER_SEC = 20;
+    const HLS_ENCODE_LEAD_SEC = 12;
     let playbackStarted = false;
     let stallTimer = null;
     let bufferWatchdog = null;
+    let encodeLeadTimer = null;
     let mediaRecoveries = 0;
     let playerListenersBound = false;
     let pausedForBuffer = false;
+    let hlsStreamId = null;
+    let encodedAheadSec = Infinity;
 
     function bufferedAhead() {
         const ranges = player.buffered;
@@ -220,12 +224,11 @@
         if (bufferWatchdog) clearInterval(bufferWatchdog);
         bufferWatchdog = setInterval(() => {
             if (!playbackStarted || player.ended || player.seeking) return;
-            const ahead = bufferedAhead();
-            if (hlsInstance && ahead < HLS_MIN_PLAY_BUFFER_SEC && !player.paused) {
+            if (hlsInstance && needsBufferPause() && !player.paused) {
                 pausedForBuffer = true;
                 player.pause();
                 showRebuffering();
-            } else if (pausedForBuffer && ahead >= HLS_RESUME_BUFFER_SEC) {
+            } else if (pausedForBuffer && canResumeFromBuffer()) {
                 pausedForBuffer = false;
                 hideLoading();
                 player.play().catch(() => {});
@@ -238,7 +241,42 @@
             clearInterval(bufferWatchdog);
             bufferWatchdog = null;
         }
+        if (encodeLeadTimer) {
+            clearInterval(encodeLeadTimer);
+            encodeLeadTimer = null;
+        }
         pausedForBuffer = false;
+        encodedAheadSec = Infinity;
+        hlsStreamId = null;
+    }
+
+    async function pollEncodeLead() {
+        if (!hlsStreamId) return;
+        try {
+            const res = await fetch(`/hls/${hlsStreamId}/status`);
+            if (!res.ok) return;
+            const { encodedSeconds } = await res.json();
+            encodedAheadSec = encodedSeconds - player.currentTime;
+        } catch (_) {}
+    }
+
+    function startEncodeLeadWatch() {
+        if (encodeLeadTimer) clearInterval(encodeLeadTimer);
+        pollEncodeLead();
+        encodeLeadTimer = setInterval(pollEncodeLead, 2000);
+    }
+
+    function needsBufferPause() {
+        if (!hlsInstance) return false;
+        const ahead = bufferedAhead();
+        if (ahead < HLS_MIN_PLAY_BUFFER_SEC) return true;
+        if (encodedAheadSec < HLS_ENCODE_LEAD_SEC) return true;
+        return false;
+    }
+
+    function canResumeFromBuffer() {
+        return bufferedAhead() >= HLS_RESUME_BUFFER_SEC
+            && encodedAheadSec >= HLS_ENCODE_LEAD_SEC;
     }
 
     function bindPlayerRecovery() {
@@ -253,9 +291,12 @@
         player.addEventListener('playing', () => { if (!pausedForBuffer) hideLoading(); });
     }
 
-    function playDirect(url) {
+    let remuxFailed = false;
+
+    function playDirect(url, onErrorFallback) {
         playbackStarted = false;
         mediaRecoveries = 0;
+        stopBufferWatchdog();
         showInitialLoading('Loading...');
         player.src = url;
         bindPlayerRecovery();
@@ -267,34 +308,37 @@
             if (!playbackStarted && player.readyState >= 2) tryStartPlayback(0.5);
         }, 8000);
         player.addEventListener('error', () => {
-            startHlsStream();
+            if (onErrorFallback) onErrorFallback();
         }, { once: true });
     }
 
-    function playHls(url) {
+    function playHls(url, streamId) {
         playbackStarted = false;
         mediaRecoveries = 0;
+        hlsStreamId = streamId || null;
+        encodedAheadSec = Infinity;
         if (window.Hls && Hls.isSupported()) {
             if (hlsInstance) hlsInstance.destroy();
             hlsInstance = new Hls({
                 enableWorker: true,
-                maxBufferLength: 120,
+                maxBufferLength: 180,
                 maxMaxBufferLength: 600,
                 maxBufferHole: 0.5,
                 startFragPrefetch: true,
                 lowLatencyMode: false,
-                liveSyncDurationCount: 4,
-                liveMaxLatencyDurationCount: 15,
+                liveSyncDurationCount: 8,
+                liveMaxLatencyDurationCount: 30,
                 maxLiveSyncPlaybackRate: 1,
-                manifestLoadingMaxRetry: 6,
-                levelLoadingMaxRetry: 6,
-                fragLoadingMaxRetry: 8,
-                fragLoadingMaxRetryTimeout: 10000,
+                manifestLoadingMaxRetry: 8,
+                levelLoadingMaxRetry: 8,
+                fragLoadingMaxRetry: 10,
+                fragLoadingMaxRetryTimeout: 15000,
             });
             hlsInstance.loadSource(url);
             hlsInstance.attachMedia(player);
             bindPlayerRecovery();
             startBufferWatchdog();
+            if (hlsStreamId) startEncodeLeadWatch();
             showInitialLoading('Loading...');
 
             const onBuffered = () => tryStartPlayback(HLS_START_BUFFER_SEC);
@@ -336,24 +380,37 @@
         showError('HLS not supported in this browser');
     }
 
-    async function startHlsStream() {
+    async function startHlsStream(forceHls = false) {
         playbackStarted = false;
         mediaRecoveries = 0;
+        stopBufferWatchdog();
         const tvfile = new URLSearchParams(window.location.search).get('tvfile');
         showInitialLoading('Preparing stream...');
         player.removeAttribute('src');
         player.load();
 
-        const endpoint = tvfile
+        const base = tvfile
             ? '/start-stream?tvfile=' + encodeURIComponent(tvfile)
             : '/start-stream?file=' + encodeURIComponent(file);
+        const endpoint = forceHls ? base + '&forceHls=1' : base;
         const res = await fetch(endpoint);
         if (!res.ok) {
             showError('Could not start stream');
             return;
         }
-        const { url } = await res.json();
-        playHls(url);
+        const data = await res.json();
+        if (data.mode === 'remux') {
+            playDirect(data.url, () => {
+                if (!remuxFailed) {
+                    remuxFailed = true;
+                    startHlsStream(true);
+                } else {
+                    showError('Stream failed to load');
+                }
+            });
+            return;
+        }
+        playHls(data.url, data.streamId);
     }
 
     async function startStream() {
@@ -368,7 +425,7 @@
             const url = tvfile
                 ? '/tv-media/' + mediaUrl(tvfile)
                 : '/stream-mp4?file=' + encodeURIComponent(file);
-            playDirect(url);
+            playDirect(url, () => startHlsStream(true));
             return;
         }
 

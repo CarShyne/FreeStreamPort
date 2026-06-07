@@ -39,17 +39,77 @@ const TV_FOLDER = process.env.TV_FOLDER || "/Volumes/2TB/Movies.2TB/TV Shows";
 const TMDB_API_KEY = process.env.TMDB_API_KEY || "866794356a9e7ac61771ae56bd99e284";
 const HLS_TMP = '/tmp/freestream-hls';
 const HLS_SEGMENT_SEC = 4;
-const HLS_HEAD_START_SEGMENTS = 5;
 const HLS_GOP = HLS_SEGMENT_SEC * 24;
+const IS_ARM = process.arch === 'arm64' || process.arch === 'arm';
 
 if (!fs.existsSync(HLS_TMP)) fs.mkdirSync(HLS_TMP, { recursive: true });
 
-let hwEncoder = null;
-try {
-    const encoders = execSync('ffmpeg -hide_banner -encoders 2>/dev/null', { encoding: 'utf8' });
-    if (process.platform === 'darwin' && encoders.includes('h264_videotoolbox')) hwEncoder = 'videotoolbox';
-    else if (encoders.includes('h264_nvenc')) hwEncoder = 'nvenc';
-} catch (_) {}
+function v4l2DevicesPresent() {
+    try {
+        return fs.readdirSync('/dev').some(name => /^video\d+$/.test(name));
+    } catch {
+        return false;
+    }
+}
+
+function defaultHwPriority() {
+    if (process.platform === 'darwin') return 'videotoolbox,nvenc,qsv,amf,v4l2m2m';
+    if (IS_ARM) return 'v4l2m2m,nvenc,qsv,amf,videotoolbox';
+    return 'nvenc,qsv,amf,videotoolbox,v4l2m2m';
+}
+
+// Hardware encoder priority — on Pi/ARM: V4L2 first, then libx264 fallback
+// Override with FREESTREAM_HW_ENCODER=v4l2m2m or FREESTREAM_HW_ENCODER=software
+const HW_ENCODER_ENV = (process.env.FREESTREAM_HW_ENCODER || '').trim();
+const HW_ENCODER_SOFTWARE = HW_ENCODER_ENV.toLowerCase() === 'software';
+const HW_ENCODER_PRIORITY = HW_ENCODER_SOFTWARE
+    ? []
+    : (HW_ENCODER_ENV || defaultHwPriority())
+        .split(',')
+        .map(s => s.trim().toLowerCase())
+        .filter(Boolean);
+
+const HW_ENCODER_MAP = {
+    v4l2m2m: 'h264_v4l2m2m',
+    nvenc: 'h264_nvenc',
+    qsv: 'h264_qsv',
+    amf: 'h264_amf',
+    videotoolbox: 'h264_videotoolbox',
+};
+
+function detectHwEncoder() {
+    if (HW_ENCODER_SOFTWARE) return null;
+    let encoders = '';
+    try {
+        encoders = execSync('ffmpeg -hide_banner -encoders 2>/dev/null', { encoding: 'utf8' });
+    } catch {
+        return null;
+    }
+    for (const name of HW_ENCODER_PRIORITY) {
+        const codec = HW_ENCODER_MAP[name];
+        if (!codec || !encoders.includes(codec)) continue;
+        if (name === 'v4l2m2m' && !v4l2DevicesPresent()) {
+            console.warn('Skipping v4l2m2m — no /dev/video* in container (see docker-compose.pi.yml)');
+            continue;
+        }
+        return name;
+    }
+    return null;
+}
+
+const hwEncoder = detectHwEncoder();
+const videoEncoderLabel = hwEncoder ? `${hwEncoder}/${HW_ENCODER_MAP[hwEncoder]}` : 'libx264 (software)';
+const HLS_HEAD_START_SEGMENTS = Number(process.env.FREESTREAM_HLS_HEAD_START)
+    || (IS_ARM && !hwEncoder ? 18 : IS_ARM ? 15 : 12);
+
+console.log(`Platform: ${process.platform}/${process.arch}`);
+console.log(`Video encoder: ${videoEncoderLabel}`);
+if (IS_ARM && hwEncoder !== 'v4l2m2m' && !v4l2DevicesPresent()) {
+    console.warn('Pi/ARM without V4L2 devices — HEVC transcode will use slow CPU encoding. Mount /dev/dri + /dev/video* for hardware.');
+}
+if (HW_ENCODER_ENV && !HW_ENCODER_SOFTWARE) {
+    console.log(`HW encoder priority: ${HW_ENCODER_PRIORITY.join(' → ')}`);
+}
 
 function countHlsSegments(outDir) {
     try {
@@ -71,6 +131,129 @@ function waitForHeadStart(outDir, minSegments, timeoutMs) {
     });
 }
 
+function buildDecodeArgs(forEncoder = hwEncoder) {
+    if (!forEncoder) {
+        if (process.platform === 'darwin') return ['-hwaccel', 'videotoolbox'];
+        if (IS_ARM && v4l2DevicesPresent()) return ['-hwaccel', 'drm', '-hwaccel_output_format', 'drm_prime'];
+        return ['-hwaccel', 'auto'];
+    }
+    switch (forEncoder) {
+        case 'v4l2m2m':
+            return v4l2DevicesPresent()
+                ? ['-hwaccel', 'drm', '-hwaccel_output_format', 'drm_prime']
+                : ['-hwaccel', 'auto'];
+        case 'nvenc':
+            return ['-hwaccel', 'cuda'];
+        case 'qsv':
+            return ['-hwaccel', 'qsv'];
+        case 'amf':
+            return fs.existsSync('/dev/dri/renderD128')
+                ? ['-hwaccel', 'vaapi', '-hwaccel_device', '/dev/dri/renderD128']
+                : ['-hwaccel', 'auto'];
+        case 'videotoolbox':
+            return ['-hwaccel', 'videotoolbox'];
+        default:
+            return ['-hwaccel', 'auto'];
+    }
+}
+
+const TRANSCODE_SCALE_HD = "scale='min(1280,iw):min(720,ih):force_original_aspect_ratio=decrease'";
+const TRANSCODE_SCALE_SD = "scale='min(854,iw):min(480,ih):force_original_aspect_ratio=decrease'";
+
+function getTranscodeScale() {
+    if (IS_ARM && !hwEncoder) return TRANSCODE_SCALE_SD;
+    return TRANSCODE_SCALE_HD;
+}
+
+function buildTranscodeKeyframeArgs() {
+    return ['-g', String(HLS_GOP), '-keyint_min', String(HLS_GOP), '-sc_threshold', '0'];
+}
+
+function buildHwTranscodeArgs(encoder) {
+    const keyframeArgs = buildTranscodeKeyframeArgs();
+    const scale = getTranscodeScale();
+    switch (encoder) {
+        case 'v4l2m2m':
+            return [
+                '-c:v', 'h264_v4l2m2m',
+                '-b:v', '2500k', '-maxrate', '3000k', '-bufsize', '6000k',
+                '-vf', scale,
+                '-num_output_buffers', '32',
+                '-num_capture_buffers', '32',
+                ...keyframeArgs,
+            ];
+        case 'nvenc':
+            return [
+                '-c:v', 'h264_nvenc',
+                '-preset', 'p5', '-tune', 'll',
+                '-b:v', '3M', '-maxrate', '4M', '-bufsize', '8M',
+                '-vf', scale,
+                '-profile:v', 'high', '-level', '4.1',
+                ...keyframeArgs,
+            ];
+        case 'qsv':
+            return [
+                '-c:v', 'h264_qsv',
+                '-preset', 'veryfast',
+                '-global_quality', '28',
+                '-b:v', '3M', '-maxrate', '4M', '-bufsize', '8M',
+                '-vf', scale,
+                '-profile:v', 'high', '-level', '4.1',
+                ...keyframeArgs,
+            ];
+        case 'amf':
+            return [
+                '-c:v', 'h264_amf',
+                '-quality', 'speed',
+                '-rc', 'vbr_latency',
+                '-b:v', '3M', '-maxrate', '4M', '-bufsize', '8M',
+                '-vf', scale,
+                '-profile:v', 'high', '-level', '4.1',
+                ...keyframeArgs,
+            ];
+        case 'videotoolbox':
+            return [
+                '-c:v', 'h264_videotoolbox',
+                '-b:v', '3M', '-maxrate', '4M', '-bufsize', '8M',
+                '-vf', scale,
+                '-profile:v', 'high', '-level', '4.1',
+                ...keyframeArgs,
+            ];
+        default:
+            return null;
+    }
+}
+
+function probeVideoCodec(fullPath) {
+    try {
+        return execSync(
+            `ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1 "${fullPath}"`,
+            { encoding: 'utf8' }
+        ).trim().replace('codec_name=', '');
+    } catch {
+        return 'hevc';
+    }
+}
+
+function getAudioMap(fullPath, settings) {
+    const audioLang = settings.preferredAudioLang || 'eng';
+    let audioMap = ['-map', '0:a:0'];
+    try {
+        const probeResult = execSync(
+            `ffprobe -v error -select_streams a -show_entries stream=index:stream_tags=language -of json "${fullPath}"`,
+            { encoding: 'utf8' }
+        );
+        const streams = JSON.parse(probeResult).streams;
+        const preferred = streams.find(s => s.tags?.language === audioLang);
+        if (preferred) {
+            const idx = streams.indexOf(preferred);
+            audioMap = ['-map', `0:a:${idx}`];
+            console.log(`Using audio track ${idx} (${audioLang})`);
+        }
+    } catch (_) {}
+    return audioMap;
+}
+
 function buildVideoArgs(inputCodec, isMkv) {
     if (inputCodec === 'h264') {
         return isMkv
@@ -78,29 +261,31 @@ function buildVideoArgs(inputCodec, isMkv) {
             : ['-c:v', 'copy', '-bsf:v', 'h264_mp4toannexb'];
     }
 
-    const scale = "scale='min(1920,iw):min(1080,ih):force_original_aspect_ratio=decrease'";
-    const keyframeArgs = ['-g', String(HLS_GOP), '-keyint_min', String(HLS_GOP), '-sc_threshold', '0'];
+    if (hwEncoder) {
+        const hwArgs = buildHwTranscodeArgs(hwEncoder);
+        if (hwArgs) return hwArgs;
+    }
 
-    if (hwEncoder === 'videotoolbox') {
-        return [
-            '-c:v', 'h264_videotoolbox',
-            '-b:v', '5M', '-maxrate', '6M', '-bufsize', '12M',
-            '-vf', scale, '-profile:v', 'high', '-level', '4.1',
-            ...keyframeArgs,
-        ];
-    }
-    if (hwEncoder === 'nvenc') {
-        return [
-            '-c:v', 'h264_nvenc', '-preset', 'p4',
-            '-b:v', '5M', '-maxrate', '6M', '-bufsize', '12M',
-            '-vf', scale, ...keyframeArgs,
-        ];
-    }
     return [
-        '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'film',
-        '-crf', '26', '-threads', '0', '-vf', scale,
-        '-pix_fmt', 'yuv420p', ...keyframeArgs,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+        '-crf', IS_ARM ? '30' : '28', '-threads', '0', '-vf', getTranscodeScale(),
+        '-pix_fmt', 'yuv420p', ...buildTranscodeKeyframeArgs(),
     ];
+}
+
+function getEncodedDuration(outDir) {
+    const playlistPath = path.join(outDir, 'index.m3u8');
+    if (!fs.existsSync(playlistPath)) {
+        return countHlsSegments(outDir) * HLS_SEGMENT_SEC;
+    }
+    try {
+        const playlist = fs.readFileSync(playlistPath, 'utf8');
+        const matches = playlist.match(/#EXTINF:([\d.]+)/g);
+        if (!matches) return countHlsSegments(outDir) * HLS_SEGMENT_SEC;
+        return matches.reduce((sum, line) => sum + parseFloat(line.split(':')[1]), 0);
+    } catch {
+        return countHlsSegments(outDir) * HLS_SEGMENT_SEC;
+    }
 }
 
 const metadataCache = {};
@@ -378,6 +563,58 @@ app.get('/hls/:streamId/:segment', (req, res) => {
     req.on('close', () => clearInterval(wait));
 });
 
+app.get('/hls/:streamId/status', (req, res) => {
+    const { streamId } = req.params;
+    const outDir = path.join(HLS_TMP, streamId);
+    const segments = countHlsSegments(outDir);
+    const encodedSeconds = getEncodedDuration(outDir);
+    res.json({
+        segments,
+        encodedSeconds,
+        segmentDuration: HLS_SEGMENT_SEC,
+        encoding: Boolean(activeStreams[streamId]),
+        videoEncoder: videoEncoderLabel,
+    });
+});
+
+// Fast remux for H.264 — streams fragmented MP4 without HLS segment overhead
+app.get('/stream-remux', (req, res) => {
+    const { file, tvfile } = req.query;
+    const settings = loadSettings();
+    const fullPath = resolveFilePath(file, tvfile, settings);
+    if (!fullPath || !fs.existsSync(fullPath)) return res.status(404).send('File not found');
+
+    const audioMap = getAudioMap(fullPath, settings);
+    const ffmpeg = spawn('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error',
+        ...buildDecodeArgs(),
+        '-probesize', '32M', '-analyzeduration', '10M',
+        '-i', fullPath,
+        '-map', '0:v:0',
+        ...audioMap,
+        '-c:v', 'copy',
+        '-c:a', 'aac', '-b:a', '192k', '-ac', '2',
+        '-max_muxing_queue_size', '9999',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        '-f', 'mp4', 'pipe:1',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    console.log('[Remux] Streaming:', fullPath);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    ffmpeg.stdout.pipe(res);
+    ffmpeg.stderr.on('data', d => console.error('[Remux]', d.toString().slice(0, 120)));
+    ffmpeg.on('error', err => {
+        console.error('[Remux spawn error]', err);
+        if (!res.headersSent) res.status(500).end();
+    });
+    const cleanup = () => { if (!ffmpeg.killed) ffmpeg.kill('SIGTERM'); };
+    req.on('close', cleanup);
+    res.on('close', cleanup);
+});
+
 // Start HLS transcode
 app.get('/start-stream', async (req, res) => {
     const file = req.query.file;
@@ -405,30 +642,23 @@ app.get('/start-stream', async (req, res) => {
 
     const isMkv = target.toLowerCase().endsWith('.mkv');
 
-    // Detect input codec
-    let inputCodec = 'hevc';
-    try {
-        inputCodec = execSync(`ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1 "${fullPath}"`).toString().trim().replace('codec_name=','');
-    } catch(e) {}
-    console.log('Input codec:', inputCodec, 'encoder:', hwEncoder || 'libx264', 'for', fullPath);
+    const inputCodec = probeVideoCodec(fullPath);
+    console.log('Input codec:', inputCodec, 'encoder:', videoEncoderLabel, 'for', fullPath);
+
+    // H.264 can be remuxed to fragmented MP4 — much smoother than live HLS
+    if (inputCodec === 'h264' && req.query.forceHls !== '1') {
+        const q = tvfile
+            ? `tvfile=${encodeURIComponent(tvfile)}`
+            : `file=${encodeURIComponent(file)}`;
+        return res.json({ mode: 'remux', url: `/stream-remux?${q}` });
+    }
 
     const videoArgs = buildVideoArgs(inputCodec, isMkv);
-
-    const audioLang = settings.preferredAudioLang || 'eng';
-    let audioMap = ['-map', '0:a:0']; // default first audio
-    try {
-        const probeResult = execSync(`ffprobe -v error -select_streams a -show_entries stream=index:stream_tags=language -of json "${fullPath}"`).toString();
-        const streams = JSON.parse(probeResult).streams;
-        const preferred = streams.find(s => s.tags?.language === audioLang);
-        if (preferred) {
-            const idx = streams.indexOf(preferred);
-            audioMap = ['-map', `0:a:${idx}`];
-            console.log(`Using audio track ${idx} (${audioLang})`);
-        }
-    } catch(e) {}
+    const audioMap = getAudioMap(fullPath, settings);
 
     const ffmpeg = spawn('ffmpeg', [
         '-hide_banner', '-loglevel', 'error',
+        ...buildDecodeArgs(),
         '-probesize', '32M', '-analyzeduration', '10M',
         '-i', fullPath,
         '-map', '0:v:0',
@@ -437,6 +667,7 @@ app.get('/start-stream', async (req, res) => {
         '-c:a', 'aac',
         '-b:a', '192k',
         '-ac', '2',
+        '-max_muxing_queue_size', '9999',
         '-hls_time', String(HLS_SEGMENT_SEC),
         '-hls_list_size', '0',
         '-hls_playlist_type', 'event',
@@ -447,20 +678,25 @@ app.get('/start-stream', async (req, res) => {
     ], { stdio: ['ignore', 'ignore', 'pipe'] });
 
     activeStreams[streamId] = ffmpeg;
-    console.log('Starting FFmpeg for:', fullPath);
+    console.log('Starting FFmpeg HLS for:', fullPath);
     ffmpeg.stderr.on('data', d => console.error('[FFmpeg]', d.toString().slice(0, 100)));
     ffmpeg.on('error', err => console.error('[FFmpeg spawn error]', err));
     ffmpeg.on('close', () => delete activeStreams[streamId]);
 
     // Let FFmpeg build a head-start buffer before the player begins consuming
-    const headStart = await waitForHeadStart(outDir, HLS_HEAD_START_SEGMENTS, 45000);
+    const headStart = await waitForHeadStart(outDir, HLS_HEAD_START_SEGMENTS, 90000);
     if (!headStart) {
         console.warn('[HLS] Head-start timeout for', streamId, '- starting with', countHlsSegments(outDir), 'segments');
     } else {
         console.log('[HLS] Head-start ready:', countHlsSegments(outDir), 'segments for', streamId);
     }
 
-    res.json({ streamId, url: `/hls/${streamId}/index.m3u8` });
+    res.json({
+        mode: 'hls',
+        streamId,
+        url: `/hls/${streamId}/index.m3u8`,
+        encodedSeconds: getEncodedDuration(outDir),
+    });
 });
 
 // Range request support for MP4
