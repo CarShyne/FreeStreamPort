@@ -154,12 +154,16 @@
         return path.split('/').map(encodeURIComponent).join('/');
     }
 
-    const HLS_START_BUFFER_SEC = 6;
+    const HLS_START_BUFFER_SEC = 12;
     const MP4_START_BUFFER_SEC = 3;
+    const HLS_MIN_PLAY_BUFFER_SEC = 4;
+    const HLS_RESUME_BUFFER_SEC = 10;
     let playbackStarted = false;
     let stallTimer = null;
+    let bufferWatchdog = null;
     let mediaRecoveries = 0;
     let playerListenersBound = false;
+    let pausedForBuffer = false;
 
     function bufferedAhead() {
         const ranges = player.buffered;
@@ -207,9 +211,34 @@
         clearTimeout(stallTimer);
         stallTimer = setTimeout(() => {
             if (!playbackStarted || player.ended) return;
-            if (hlsInstance) hlsInstance.startLoad(-1);
-            if (player.paused) player.play().catch(() => {});
-        }, 2500);
+            if (hlsInstance) hlsInstance.startLoad();
+            if (player.paused && !pausedForBuffer) player.play().catch(() => {});
+        }, 1500);
+    }
+
+    function startBufferWatchdog() {
+        if (bufferWatchdog) clearInterval(bufferWatchdog);
+        bufferWatchdog = setInterval(() => {
+            if (!playbackStarted || player.ended || player.seeking) return;
+            const ahead = bufferedAhead();
+            if (hlsInstance && ahead < HLS_MIN_PLAY_BUFFER_SEC && !player.paused) {
+                pausedForBuffer = true;
+                player.pause();
+                showRebuffering();
+            } else if (pausedForBuffer && ahead >= HLS_RESUME_BUFFER_SEC) {
+                pausedForBuffer = false;
+                hideLoading();
+                player.play().catch(() => {});
+            }
+        }, 500);
+    }
+
+    function stopBufferWatchdog() {
+        if (bufferWatchdog) {
+            clearInterval(bufferWatchdog);
+            bufferWatchdog = null;
+        }
+        pausedForBuffer = false;
     }
 
     function bindPlayerRecovery() {
@@ -220,8 +249,8 @@
             scheduleStallRecovery();
         });
         player.addEventListener('stalled', scheduleStallRecovery);
-        player.addEventListener('canplay', hideLoading);
-        player.addEventListener('playing', hideLoading);
+        player.addEventListener('canplay', () => { if (!pausedForBuffer) hideLoading(); });
+        player.addEventListener('playing', () => { if (!pausedForBuffer) hideLoading(); });
     }
 
     function playDirect(url) {
@@ -249,14 +278,23 @@
             if (hlsInstance) hlsInstance.destroy();
             hlsInstance = new Hls({
                 enableWorker: true,
-                maxBufferLength: 60,
+                maxBufferLength: 120,
                 maxMaxBufferLength: 600,
-                maxBufferHole: 1,
+                maxBufferHole: 0.5,
                 startFragPrefetch: true,
+                lowLatencyMode: false,
+                liveSyncDurationCount: 4,
+                liveMaxLatencyDurationCount: 15,
+                maxLiveSyncPlaybackRate: 1,
+                manifestLoadingMaxRetry: 6,
+                levelLoadingMaxRetry: 6,
+                fragLoadingMaxRetry: 8,
+                fragLoadingMaxRetryTimeout: 10000,
             });
             hlsInstance.loadSource(url);
             hlsInstance.attachMedia(player);
             bindPlayerRecovery();
+            startBufferWatchdog();
             showInitialLoading('Loading...');
 
             const onBuffered = () => tryStartPlayback(HLS_START_BUFFER_SEC);

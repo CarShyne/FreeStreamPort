@@ -38,8 +38,70 @@ const MEDIA_FOLDER = process.env.MEDIA_FOLDER || "/Volumes/2TB/Movies.2TB";
 const TV_FOLDER = process.env.TV_FOLDER || "/Volumes/2TB/Movies.2TB/TV Shows";
 const TMDB_API_KEY = process.env.TMDB_API_KEY || "866794356a9e7ac61771ae56bd99e284";
 const HLS_TMP = '/tmp/freestream-hls';
+const HLS_SEGMENT_SEC = 4;
+const HLS_HEAD_START_SEGMENTS = 5;
+const HLS_GOP = HLS_SEGMENT_SEC * 24;
 
 if (!fs.existsSync(HLS_TMP)) fs.mkdirSync(HLS_TMP, { recursive: true });
+
+let hwEncoder = null;
+try {
+    const encoders = execSync('ffmpeg -hide_banner -encoders 2>/dev/null', { encoding: 'utf8' });
+    if (process.platform === 'darwin' && encoders.includes('h264_videotoolbox')) hwEncoder = 'videotoolbox';
+    else if (encoders.includes('h264_nvenc')) hwEncoder = 'nvenc';
+} catch (_) {}
+
+function countHlsSegments(outDir) {
+    try {
+        return fs.readdirSync(outDir).filter(f => f.endsWith('.ts')).length;
+    } catch {
+        return 0;
+    }
+}
+
+function waitForHeadStart(outDir, minSegments, timeoutMs) {
+    return new Promise(resolve => {
+        const deadline = Date.now() + timeoutMs;
+        const tick = () => {
+            if (countHlsSegments(outDir) >= minSegments) return resolve(true);
+            if (Date.now() >= deadline) return resolve(false);
+            setTimeout(tick, 400);
+        };
+        tick();
+    });
+}
+
+function buildVideoArgs(inputCodec, isMkv) {
+    if (inputCodec === 'h264') {
+        return isMkv
+            ? ['-c:v', 'copy']
+            : ['-c:v', 'copy', '-bsf:v', 'h264_mp4toannexb'];
+    }
+
+    const scale = "scale='min(1920,iw):min(1080,ih):force_original_aspect_ratio=decrease'";
+    const keyframeArgs = ['-g', String(HLS_GOP), '-keyint_min', String(HLS_GOP), '-sc_threshold', '0'];
+
+    if (hwEncoder === 'videotoolbox') {
+        return [
+            '-c:v', 'h264_videotoolbox',
+            '-b:v', '5M', '-maxrate', '6M', '-bufsize', '12M',
+            '-vf', scale, '-profile:v', 'high', '-level', '4.1',
+            ...keyframeArgs,
+        ];
+    }
+    if (hwEncoder === 'nvenc') {
+        return [
+            '-c:v', 'h264_nvenc', '-preset', 'p4',
+            '-b:v', '5M', '-maxrate', '6M', '-bufsize', '12M',
+            '-vf', scale, ...keyframeArgs,
+        ];
+    }
+    return [
+        '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'film',
+        '-crf', '26', '-threads', '0', '-vf', scale,
+        '-pix_fmt', 'yuv420p', ...keyframeArgs,
+    ];
+}
 
 const metadataCache = {};
 const activeStreams = {};
@@ -308,16 +370,16 @@ app.get('/hls/:streamId/:segment', (req, res) => {
         if (fs.existsSync(segPath)) {
             clearInterval(wait);
             sendHlsSegment(res, segPath, segment);
-        } else if (++attempts > 40) {
+        } else if (++attempts > 100) {
             clearInterval(wait);
             res.status(404).send('Segment not found');
         }
-    }, 250);
+    }, 100);
     req.on('close', () => clearInterval(wait));
 });
 
 // Start HLS transcode
-app.get('/start-stream', (req, res) => {
+app.get('/start-stream', async (req, res) => {
     const file = req.query.file;
     const tvfile = req.query.tvfile;
     const target = tvfile || file;
@@ -330,10 +392,15 @@ app.get('/start-stream', (req, res) => {
 
     if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
 
-    // Kill existing stream for this file
+    // Kill existing stream for this file and clear stale segments
     if (activeStreams[streamId]) {
         activeStreams[streamId].kill();
         delete activeStreams[streamId];
+    }
+    for (const f of fs.readdirSync(outDir)) {
+        if (f.endsWith('.ts') || f.endsWith('.m3u8')) {
+            fs.unlinkSync(path.join(outDir, f));
+        }
     }
 
     const isMkv = target.toLowerCase().endsWith('.mkv');
@@ -343,13 +410,9 @@ app.get('/start-stream', (req, res) => {
     try {
         inputCodec = execSync(`ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1 "${fullPath}"`).toString().trim().replace('codec_name=','');
     } catch(e) {}
-    console.log('Input codec:', inputCodec, 'for', fullPath);
+    console.log('Input codec:', inputCodec, 'encoder:', hwEncoder || 'libx264', 'for', fullPath);
 
-    const videoArgs = inputCodec === 'h264'
-        ? (isMkv
-            ? ['-c:v', 'copy']
-            : ['-c:v', 'copy', '-bsf:v', 'h264_mp4toannexb'])
-        : ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '23', '-threads', '0', '-g', '48', '-keyint_min', '48', '-sc_threshold', '0'];
+    const videoArgs = buildVideoArgs(inputCodec, isMkv);
 
     const audioLang = settings.preferredAudioLang || 'eng';
     let audioMap = ['-map', '0:a:0']; // default first audio
@@ -374,10 +437,11 @@ app.get('/start-stream', (req, res) => {
         '-c:a', 'aac',
         '-b:a', '192k',
         '-ac', '2',
-        '-hls_time', '2',
+        '-hls_time', String(HLS_SEGMENT_SEC),
         '-hls_list_size', '0',
         '-hls_playlist_type', 'event',
         '-hls_flags', 'independent_segments+append_list',
+        '-force_key_frames', `expr:gte(t,n_forced*${HLS_SEGMENT_SEC})`,
         '-hls_segment_filename', path.join(outDir, 'seg%03d.ts'),
         path.join(outDir, 'index.m3u8')
     ], { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -387,6 +451,14 @@ app.get('/start-stream', (req, res) => {
     ffmpeg.stderr.on('data', d => console.error('[FFmpeg]', d.toString().slice(0, 100)));
     ffmpeg.on('error', err => console.error('[FFmpeg spawn error]', err));
     ffmpeg.on('close', () => delete activeStreams[streamId]);
+
+    // Let FFmpeg build a head-start buffer before the player begins consuming
+    const headStart = await waitForHeadStart(outDir, HLS_HEAD_START_SEGMENTS, 45000);
+    if (!headStart) {
+        console.warn('[HLS] Head-start timeout for', streamId, '- starting with', countHlsSegments(outDir), 'segments');
+    } else {
+        console.log('[HLS] Head-start ready:', countHlsSegments(outDir), 'segments for', streamId);
+    }
 
     res.json({ streamId, url: `/hls/${streamId}/index.m3u8` });
 });
