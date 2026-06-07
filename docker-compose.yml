@@ -19,3 +19,5 @@ services:
       - TMDB_API_KEY=866794356a9e7ac61771ae56bd99e284
       - FREESTREAM_USER=admin
       - FREESTREAM_PASSWORD=xxxx
+    # For hardware transcoding in Docker, use docker-compose.hw.yml instead.
+    # Native Mac/Linux runs auto-detect NVENC/QSV/AMF/VideoToolbox/V4L2 with no extra config.

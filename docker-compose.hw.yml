@@ -1,0 +1,61 @@
+# Hardware-accelerated Docker deploy — works on any host with GPU/V4L2 passthrough.
+# FreeStream auto-detects the best encoder at runtime (no platform-specific config needed).
+#
+# Usage: docker compose -f docker-compose.hw.yml up -d --build
+#
+# What gets detected:
+#   NVIDIA GPU  → h264_nvenc   (mount nvidia runtime / /dev/nvidia*)
+#   Intel iGPU  → h264_qsv    (mount /dev/dri)
+#   AMD GPU     → h264_amf     (mount /dev/dri)
+#   Raspberry Pi → h264_v4l2m2m (mount /dev/dri + V4L2 video devices)
+#   macOS native → h264_videotoolbox (run outside Docker, or on Mac with VT passthrough)
+#
+# Check after start: curl http://localhost:3000/api/status  → encoding.videoEncoder
+
+version: '3.8'
+
+services:
+  freestream:
+    build: .
+    container_name: freestream
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ${MEDIA_PATH:-/mnt/media/movies}:/media/movies
+      - ${TV_PATH:-/mnt/media/tvshows}:/media/tvshows
+      - freestream-hls:/tmp/freestream-hls
+      - freestream-data:/data
+    # --- Pick what matches your hardware (uncomment as needed) ---
+
+    # Intel / AMD / Raspberry Pi (V4L2 + DRM)
+    devices:
+      - /dev/dri:/dev/dri
+    device_cgroup_rules:
+      - 'c 81:* rmw'
+    group_add:
+      - video
+
+    # NVIDIA — use instead of devices:/dev/dri when you have an NVIDIA GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu, video, compute, utility]
+
+    environment:
+      MEDIA_FOLDER: /media/movies
+      TV_FOLDER: /media/tvshows
+      PORT: "3000"
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
+      FREESTREAM_USER: ${FREESTREAM_USER:-admin}
+      FREESTREAM_PASSWORD: ${FREESTREAM_PASSWORD:-admin}
+      FREESTREAM_DATA_DIR: /data
+      # Optional: override auto-detect order
+      # FREESTREAM_HW_ENCODER=nvenc,qsv,amf,v4l2m2m
+
+volumes:
+  freestream-hls:
+  freestream-data:

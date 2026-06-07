@@ -40,31 +40,17 @@ const TMDB_API_KEY = process.env.TMDB_API_KEY || "866794356a9e7ac61771ae56bd99e2
 const HLS_TMP = '/tmp/freestream-hls';
 const HLS_SEGMENT_SEC = 4;
 const HLS_GOP = HLS_SEGMENT_SEC * 24;
-const IS_ARM = process.arch === 'arm64' || process.arch === 'arm';
 
 if (!fs.existsSync(HLS_TMP)) fs.mkdirSync(HLS_TMP, { recursive: true });
 
-function v4l2DevicesPresent() {
-    try {
-        return fs.readdirSync('/dev').some(name => /^video\d+$/.test(name));
-    } catch {
-        return false;
-    }
-}
-
-function defaultHwPriority() {
-    if (process.platform === 'darwin') return 'videotoolbox,nvenc,qsv,amf,v4l2m2m';
-    if (IS_ARM) return 'v4l2m2m,nvenc,qsv,amf,videotoolbox';
-    return 'nvenc,qsv,amf,videotoolbox,v4l2m2m';
-}
-
-// Hardware encoder priority — on Pi/ARM: V4L2 first, then libx264 fallback
-// Override with FREESTREAM_HW_ENCODER=v4l2m2m or FREESTREAM_HW_ENCODER=software
+// Auto-detect the best available FFmpeg hardware encoder on any host.
+// Override order with FREESTREAM_HW_ENCODER=nvenc,amf,qsv or force FREESTREAM_HW_ENCODER=software
 const HW_ENCODER_ENV = (process.env.FREESTREAM_HW_ENCODER || '').trim();
 const HW_ENCODER_SOFTWARE = HW_ENCODER_ENV.toLowerCase() === 'software';
+const DEFAULT_ENCODER_ORDER = ['nvenc', 'qsv', 'amf', 'videotoolbox', 'v4l2m2m'];
 const HW_ENCODER_PRIORITY = HW_ENCODER_SOFTWARE
     ? []
-    : (HW_ENCODER_ENV || defaultHwPriority())
+    : (HW_ENCODER_ENV || DEFAULT_ENCODER_ORDER.join(','))
         .split(',')
         .map(s => s.trim().toLowerCase())
         .filter(Boolean);
@@ -77,35 +63,88 @@ const HW_ENCODER_MAP = {
     videotoolbox: 'h264_videotoolbox',
 };
 
-function detectHwEncoder() {
-    if (HW_ENCODER_SOFTWARE) return null;
-    let encoders = '';
+function nvidiaGpuPresent() {
+    return fs.existsSync('/dev/nvidia0') || fs.existsSync('/dev/nvidiactl');
+}
+
+function driPresent() {
+    return fs.existsSync('/dev/dri/renderD128') || fs.existsSync('/dev/dri/card0');
+}
+
+function v4l2DevicesPresent() {
     try {
-        encoders = execSync('ffmpeg -hide_banner -encoders 2>/dev/null', { encoding: 'utf8' });
+        return fs.readdirSync('/dev').some(name => /^video\d+$/.test(name));
     } catch {
-        return null;
+        return false;
     }
-    for (const name of HW_ENCODER_PRIORITY) {
+}
+
+function encoderRequirementsMet(name) {
+    switch (name) {
+        case 'nvenc':
+            return nvidiaGpuPresent();
+        case 'qsv':
+        case 'amf':
+            return driPresent();
+        case 'videotoolbox':
+            return process.platform === 'darwin';
+        case 'v4l2m2m':
+            return v4l2DevicesPresent();
+        default:
+            return false;
+    }
+}
+
+function loadFfmpegEncoders() {
+    try {
+        return execSync('ffmpeg -hide_banner -encoders 2>/dev/null', { encoding: 'utf8' });
+    } catch {
+        return '';
+    }
+}
+
+function probeAvailableEncoders(ffmpegEncoders) {
+    const available = [];
+    for (const name of DEFAULT_ENCODER_ORDER) {
         const codec = HW_ENCODER_MAP[name];
-        if (!codec || !encoders.includes(codec)) continue;
-        if (name === 'v4l2m2m' && !v4l2DevicesPresent()) {
-            console.warn('Skipping v4l2m2m — no /dev/video* in container (see docker-compose.pi.yml)');
-            continue;
+        if (codec && ffmpegEncoders.includes(codec) && encoderRequirementsMet(name)) {
+            available.push(name);
         }
-        return name;
+    }
+    return available;
+}
+
+function detectHwEncoder(ffmpegEncoders, available) {
+    if (HW_ENCODER_SOFTWARE) return null;
+    for (const name of HW_ENCODER_PRIORITY) {
+        if (available.includes(name)) return name;
     }
     return null;
 }
 
-const hwEncoder = detectHwEncoder();
+function getEncoderInfo() {
+    return {
+        platform: `${process.platform}/${process.arch}`,
+        videoEncoder: videoEncoderLabel,
+        hardwareEncoder: hwEncoder,
+        availableEncoders: availableHwEncoders,
+        encoderOrder: HW_ENCODER_PRIORITY.length ? HW_ENCODER_PRIORITY : DEFAULT_ENCODER_ORDER,
+        softwareFallback: !hwEncoder,
+    };
+}
+
+const ffmpegEncoders = loadFfmpegEncoders();
+const availableHwEncoders = probeAvailableEncoders(ffmpegEncoders);
+const hwEncoder = detectHwEncoder(ffmpegEncoders, availableHwEncoders);
 const videoEncoderLabel = hwEncoder ? `${hwEncoder}/${HW_ENCODER_MAP[hwEncoder]}` : 'libx264 (software)';
 const HLS_HEAD_START_SEGMENTS = Number(process.env.FREESTREAM_HLS_HEAD_START)
-    || (IS_ARM && !hwEncoder ? 18 : IS_ARM ? 15 : 12);
+    || (!hwEncoder ? 18 : 12);
 
 console.log(`Platform: ${process.platform}/${process.arch}`);
+console.log(`Available HW encoders: ${availableHwEncoders.length ? availableHwEncoders.join(', ') : 'none'}`);
 console.log(`Video encoder: ${videoEncoderLabel}`);
-if (IS_ARM && hwEncoder !== 'v4l2m2m' && !v4l2DevicesPresent()) {
-    console.warn('Pi/ARM without V4L2 devices — HEVC transcode will use slow CPU encoding. Mount /dev/dri + /dev/video* for hardware.');
+if (!hwEncoder) {
+    console.warn('No hardware encoder available — using libx264. Pass GPU/V4L2 devices into Docker or run natively for HW accel.');
 }
 if (HW_ENCODER_ENV && !HW_ENCODER_SOFTWARE) {
     console.log(`HW encoder priority: ${HW_ENCODER_PRIORITY.join(' → ')}`);
@@ -134,7 +173,9 @@ function waitForHeadStart(outDir, minSegments, timeoutMs) {
 function buildDecodeArgs(forEncoder = hwEncoder) {
     if (!forEncoder) {
         if (process.platform === 'darwin') return ['-hwaccel', 'videotoolbox'];
-        if (IS_ARM && v4l2DevicesPresent()) return ['-hwaccel', 'drm', '-hwaccel_output_format', 'drm_prime'];
+        if (nvidiaGpuPresent()) return ['-hwaccel', 'cuda'];
+        if (v4l2DevicesPresent()) return ['-hwaccel', 'drm', '-hwaccel_output_format', 'drm_prime'];
+        if (driPresent()) return ['-hwaccel', 'auto'];
         return ['-hwaccel', 'auto'];
     }
     switch (forEncoder) {
@@ -143,9 +184,9 @@ function buildDecodeArgs(forEncoder = hwEncoder) {
                 ? ['-hwaccel', 'drm', '-hwaccel_output_format', 'drm_prime']
                 : ['-hwaccel', 'auto'];
         case 'nvenc':
-            return ['-hwaccel', 'cuda'];
+            return nvidiaGpuPresent() ? ['-hwaccel', 'cuda'] : ['-hwaccel', 'auto'];
         case 'qsv':
-            return ['-hwaccel', 'qsv'];
+            return driPresent() ? ['-hwaccel', 'qsv'] : ['-hwaccel', 'auto'];
         case 'amf':
             return fs.existsSync('/dev/dri/renderD128')
                 ? ['-hwaccel', 'vaapi', '-hwaccel_device', '/dev/dri/renderD128']
@@ -161,7 +202,7 @@ const TRANSCODE_SCALE_HD = "scale='min(1280,iw):min(720,ih):force_original_aspec
 const TRANSCODE_SCALE_SD = "scale='min(854,iw):min(480,ih):force_original_aspect_ratio=decrease'";
 
 function getTranscodeScale() {
-    if (IS_ARM && !hwEncoder) return TRANSCODE_SCALE_SD;
+    if (!hwEncoder) return TRANSCODE_SCALE_SD;
     return TRANSCODE_SCALE_HD;
 }
 
@@ -268,7 +309,7 @@ function buildVideoArgs(inputCodec, isMkv) {
 
     return [
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
-        '-crf', IS_ARM ? '30' : '28', '-threads', '0', '-vf', getTranscodeScale(),
+        '-crf', '30', '-threads', '0', '-vf', getTranscodeScale(),
         '-pix_fmt', 'yuv420p', ...buildTranscodeKeyframeArgs(),
     ];
 }
@@ -837,7 +878,8 @@ app.get('/api/status', (req, res) => {
     res.json({
         version: APP_VERSION,
         mediaFolders: media.status,
-        tvFolder: checkFolder(getTvFolder(settings))
+        tvFolder: checkFolder(getTvFolder(settings)),
+        encoding: getEncoderInfo(),
     });
 });
 
