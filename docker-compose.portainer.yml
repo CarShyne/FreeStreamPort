@@ -14,9 +14,8 @@ services:
     ports:
       - "3001:3000"
     volumes:
-      - /srv/dev-disk-by-uuid-ef6d3ece-2b16-4ae0-bda5-3c5fe4d26ebc/2TB/Movies.2TB:/media/movies
-      - /srv/dev-disk-by-uuid-ef6d3ece-2b16-4ae0-bda5-3c5fe4d26ebc/2TB/Movies.2TB/Tv Shows:/media/Tv
-      - freestream-hls:/tmp/freestream-hls
+      /media/movies
+      /media/Tv
       - freestream-data:/data
     environment:
       MEDIA_FOLDER: /media/movies
