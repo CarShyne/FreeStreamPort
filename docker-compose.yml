@@ -9,8 +9,8 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ${MEDIA_PATH:-/mnt/media/movies}:/media/movies
-      - ${TV_PATH:-/mnt/media/tvshows}:/media/tvshows
+      - ${MEDIA_PATH:-/media/movies
+      - ${TV_PATH:-/media/tvshows
       - /tmp/freestream-hls:/tmp/freestream-hls
     environment:
       - MEDIA_FOLDER=/media/movies
