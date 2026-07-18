@@ -2,7 +2,8 @@ import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { exec, spawn, execSync } from 'child_process';
+import { exec, spawn, execSync, execFile } from 'child_process';
+import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 import fetch from 'node-fetch';
 import { loadSettings, saveSettings, APP_VERSION } from './settings.js';
@@ -11,10 +12,12 @@ import {
     handleLogin,
     handleLogout,
     handleAuthStatus,
+    createMediaToken,
 } from './auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const execFileP = promisify(execFile);
 
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
@@ -79,6 +82,16 @@ function v4l2DevicesPresent() {
     }
 }
 
+// Pi 5 has no hardware video *encoder* (its /dev/video* nodes are HEVC decode only),
+// so h264_v4l2m2m must never be selected there.
+function isRaspberryPi5() {
+    try {
+        return fs.readFileSync('/proc/device-tree/model', 'utf8').includes('Raspberry Pi 5');
+    } catch {
+        return false;
+    }
+}
+
 function encoderRequirementsMet(name) {
     switch (name) {
         case 'nvenc':
@@ -89,7 +102,7 @@ function encoderRequirementsMet(name) {
         case 'videotoolbox':
             return process.platform === 'darwin';
         case 'v4l2m2m':
-            return v4l2DevicesPresent();
+            return v4l2DevicesPresent() && !isRaspberryPi5();
         default:
             return false;
     }
@@ -138,7 +151,8 @@ const availableHwEncoders = probeAvailableEncoders(ffmpegEncoders);
 const hwEncoder = detectHwEncoder(ffmpegEncoders, availableHwEncoders);
 const videoEncoderLabel = hwEncoder ? `${hwEncoder}/${HW_ENCODER_MAP[hwEncoder]}` : 'libx264 (software)';
 const HLS_HEAD_START_SEGMENTS = Number(process.env.FREESTREAM_HLS_HEAD_START)
-    || (!hwEncoder ? 18 : 12);
+    || (!hwEncoder ? 6 : 4);
+const HLS_HEAD_START_COPY_SEGMENTS = 3;
 
 console.log(`Platform: ${process.platform}/${process.arch}`);
 console.log(`Available HW encoders: ${availableHwEncoders.length ? availableHwEncoders.join(', ') : 'none'}`);
@@ -174,8 +188,7 @@ function buildDecodeArgs(forEncoder = hwEncoder) {
     if (!forEncoder) {
         if (process.platform === 'darwin') return ['-hwaccel', 'videotoolbox'];
         if (nvidiaGpuPresent()) return ['-hwaccel', 'cuda'];
-        if (v4l2DevicesPresent()) return ['-hwaccel', 'drm', '-hwaccel_output_format', 'drm_prime'];
-        if (driPresent()) return ['-hwaccel', 'auto'];
+        // Note: no drm_prime here — software encoders can't consume DRM frames
         return ['-hwaccel', 'auto'];
     }
     switch (forEncoder) {
@@ -265,26 +278,29 @@ function buildHwTranscodeArgs(encoder) {
     }
 }
 
-function probeVideoCodec(fullPath) {
+async function probeVideoCodec(fullPath) {
     try {
-        return execSync(
-            `ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1 "${fullPath}"`,
-            { encoding: 'utf8' }
-        ).trim().replace('codec_name=', '');
+        const { stdout } = await execFileP('ffprobe', [
+            '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=codec_name',
+            '-of', 'default=noprint_wrappers=1', fullPath,
+        ]);
+        return stdout.trim().replace('codec_name=', '');
     } catch {
         return 'hevc';
     }
 }
 
-function getAudioMap(fullPath, settings) {
+async function getAudioMap(fullPath, settings) {
     const audioLang = settings.preferredAudioLang || 'eng';
     let audioMap = ['-map', '0:a:0'];
     try {
-        const probeResult = execSync(
-            `ffprobe -v error -select_streams a -show_entries stream=index:stream_tags=language -of json "${fullPath}"`,
-            { encoding: 'utf8' }
-        );
-        const streams = JSON.parse(probeResult).streams;
+        const { stdout } = await execFileP('ffprobe', [
+            '-v', 'error', '-select_streams', 'a',
+            '-show_entries', 'stream=index:stream_tags=language',
+            '-of', 'json', fullPath,
+        ]);
+        const streams = JSON.parse(stdout).streams;
         const preferred = streams.find(s => s.tags?.language === audioLang);
         if (preferred) {
             const idx = streams.indexOf(preferred);
@@ -307,8 +323,9 @@ function buildVideoArgs(inputCodec, isMkv) {
         if (hwArgs) return hwArgs;
     }
 
+    // No zerolatency: it disables frame threading, which badly hurts encode speed
     return [
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+        '-c:v', 'libx264', '-preset', 'ultrafast',
         '-crf', '30', '-threads', '0', '-vf', getTranscodeScale(),
         '-pix_fmt', 'yuv420p', ...buildTranscodeKeyframeArgs(),
     ];
@@ -331,6 +348,53 @@ function getEncodedDuration(outDir) {
 
 const metadataCache = {};
 const activeStreams = {};
+const activeByFile = {};
+const streamLastAccess = {};
+const backgroundRemuxes = new Set();
+const STREAM_IDLE_MS = 2 * 60 * 1000;
+
+function touchStream(streamId) {
+    streamLastAccess[streamId] = Date.now();
+}
+
+// Kill FFmpeg jobs nobody is watching (player closed / tab gone)
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, proc] of Object.entries(activeStreams)) {
+        if (now - (streamLastAccess[id] || 0) > STREAM_IDLE_MS) {
+            console.log('[Reaper] Killing idle FFmpeg for stream', id);
+            proc.kill('SIGTERM');
+            delete activeStreams[id];
+        }
+    }
+}, 30 * 1000);
+
+// Prune stale HLS/cache dirs so /tmp doesn't fill up.
+// Dirs with a cached play.mp4 are kept 7 days, plain segment dirs 24h.
+function pruneHlsTmp() {
+    let entries;
+    try { entries = fs.readdirSync(HLS_TMP); } catch { return; }
+    for (const dir of entries) {
+        const full = path.join(HLS_TMP, dir);
+        try {
+            if (!fs.statSync(full).isDirectory() || activeStreams[dir]) continue;
+            let newest = 0;
+            let hasCache = false;
+            for (const f of fs.readdirSync(full)) {
+                const st = fs.statSync(path.join(full, f));
+                if (st.mtimeMs > newest) newest = st.mtimeMs;
+                if (f === 'play.mp4') hasCache = true;
+            }
+            const maxAge = (hasCache ? 7 * 24 : 24) * 3600 * 1000;
+            if (Date.now() - newest > maxAge) {
+                console.log('[Prune] Removing stale stream dir', dir);
+                fs.rmSync(full, { recursive: true, force: true });
+            }
+        } catch {}
+    }
+}
+pruneHlsTmp();
+setInterval(pruneHlsTmp, 6 * 3600 * 1000);
 
 function getMediaFolders(settings) {
     if (process.env.MEDIA_FOLDER) return [process.env.MEDIA_FOLDER];
@@ -552,8 +616,31 @@ app.get('/open', (req, res) => {
 });
 
 // HLS streaming endpoint
+function serveHlsPlaylist(res, playlistPath, token) {
+    let body = fs.readFileSync(playlistPath, 'utf8');
+    if (!body.includes('#EXT-X-START:')) {
+        body = body.replace(
+            '#EXTM3U\n',
+            '#EXTM3U\n#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n'
+        );
+    }
+    // Propagate the media token to segment URLs (iOS fetches them cookie-less)
+    if (token && /^[a-f0-9]+$/i.test(token)) {
+        body = body.split('\n').map(line => {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) return line;
+            return `${trimmed}?token=${token}`;
+        }).join('\n');
+    }
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.send(body);
+}
+
 app.get('/hls/:streamId/index.m3u8', (req, res) => {
     const { streamId } = req.params;
+    touchStream(streamId);
     const playlistPath = path.join(HLS_TMP, streamId, 'index.m3u8');
 
     // Wait up to 10s for playlist to appear
@@ -561,9 +648,7 @@ app.get('/hls/:streamId/index.m3u8', (req, res) => {
     const wait = setInterval(() => {
         if (fs.existsSync(playlistPath)) {
             clearInterval(wait);
-            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.sendFile(playlistPath);
+            serveHlsPlaylist(res, playlistPath, req.query.token);
         } else if (++attempts > 20) {
             clearInterval(wait);
             res.status(404).send('Playlist not ready');
@@ -580,6 +665,7 @@ function sendHlsSegment(res, segPath, segment) {
 
 app.get('/hls/:streamId/:segment', (req, res) => {
     const { streamId, segment } = req.params;
+    touchStream(streamId);
     const segPath = path.join(HLS_TMP, streamId, segment);
 
     if (fs.existsSync(segPath)) {
@@ -604,8 +690,96 @@ app.get('/hls/:streamId/:segment', (req, res) => {
     req.on('close', () => clearInterval(wait));
 });
 
+function sendMp4Range(req, res, fullPath) {
+    const stat = fs.statSync(fullPath);
+    const fileSize = stat.size;
+    const range = req.headers.range;
+    if (range) {
+        const parts = range.replace(/bytes=/, '').split('-');
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+        const chunkSize = (end - start) + 1;
+        res.writeHead(206, {
+            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': chunkSize,
+            'Content-Type': 'video/mp4',
+        });
+        fs.createReadStream(fullPath, { start, end }).pipe(res);
+    } else {
+        res.writeHead(200, {
+            'Content-Length': fileSize,
+            'Content-Type': 'video/mp4',
+            'Accept-Ranges': 'bytes',
+        });
+        fs.createReadStream(fullPath).pipe(res);
+    }
+}
+
+function waitForFfmpeg(ffmpeg) {
+    return new Promise((resolve, reject) => {
+        ffmpeg.on('close', code => {
+            if (code === 0) resolve();
+            else reject(new Error(`ffmpeg exited ${code}`));
+        });
+        ffmpeg.on('error', reject);
+    });
+}
+
+function cachedMp4IsValid(mp4Path, sourcePath) {
+    try {
+        if (!fs.existsSync(mp4Path)) return false;
+        const mp4Stat = fs.statSync(mp4Path);
+        const srcStat = fs.statSync(sourcePath);
+        return mp4Stat.size > 65536 && mp4Stat.mtimeMs >= srcStat.mtimeMs;
+    } catch {
+        return false;
+    }
+}
+
+async function remuxToCachedMp4(fullPath, mp4Path, audioMap) {
+    const tmpPath = mp4Path + '.part';
+    const ffmpeg = spawn('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error',
+        '-probesize', '32M', '-analyzeduration', '10M',
+        '-i', fullPath,
+        '-map', '0:v:0',
+        ...audioMap,
+        '-c:v', 'copy',
+        '-c:a', 'aac', '-b:a', '192k', '-ac', '2',
+        '-max_muxing_queue_size', '9999',
+        '-movflags', '+faststart',
+        '-f', 'mp4',
+        '-y', tmpPath,
+    ], { stdio: ['ignore', 'ignore', 'pipe'] });
+    ffmpeg.stderr.on('data', d => console.error('[Remux]', d.toString().slice(0, 120)));
+    await waitForFfmpeg(ffmpeg);
+    fs.renameSync(tmpPath, mp4Path);
+}
+
+// Build the seekable MP4 cache without blocking playback (first play streams via HLS copy)
+function buildCachedMp4InBackground(fullPath, mp4Path, audioMap) {
+    if (backgroundRemuxes.has(mp4Path)) return;
+    backgroundRemuxes.add(mp4Path);
+    console.log('[Remux] Building cached MP4 in background for:', fullPath);
+    remuxToCachedMp4(fullPath, mp4Path, audioMap)
+        .then(() => console.log('[Remux] Cached MP4 ready:', mp4Path))
+        .catch(err => {
+            console.warn('[Remux] Background cache failed:', err.message);
+            try { fs.unlinkSync(mp4Path + '.part'); } catch {}
+        })
+        .finally(() => backgroundRemuxes.delete(mp4Path));
+}
+
+app.get('/stream-cache/:streamId/play.mp4', (req, res) => {
+    const mp4Path = path.join(HLS_TMP, req.params.streamId, 'play.mp4');
+    if (!fs.existsSync(mp4Path)) return res.status(404).send('Not ready');
+    sendMp4Range(req, res, mp4Path);
+});
+
 app.get('/hls/:streamId/status', (req, res) => {
     const { streamId } = req.params;
+    touchStream(streamId);
     const outDir = path.join(HLS_TMP, streamId);
     const segments = countHlsSegments(outDir);
     const encodedSeconds = getEncodedDuration(outDir);
@@ -619,16 +793,15 @@ app.get('/hls/:streamId/status', (req, res) => {
 });
 
 // Fast remux for H.264 — streams fragmented MP4 without HLS segment overhead
-app.get('/stream-remux', (req, res) => {
+app.get('/stream-remux', async (req, res) => {
     const { file, tvfile } = req.query;
     const settings = loadSettings();
     const fullPath = resolveFilePath(file, tvfile, settings);
     if (!fullPath || !fs.existsSync(fullPath)) return res.status(404).send('File not found');
 
-    const audioMap = getAudioMap(fullPath, settings);
+    const audioMap = await getAudioMap(fullPath, settings);
     const ffmpeg = spawn('ffmpeg', [
         '-hide_banner', '-loglevel', 'error',
-        ...buildDecodeArgs(),
         '-probesize', '32M', '-analyzeduration', '10M',
         '-i', fullPath,
         '-map', '0:v:0',
@@ -661,40 +834,64 @@ app.get('/start-stream', async (req, res) => {
     const file = req.query.file;
     const tvfile = req.query.tvfile;
     const target = tvfile || file;
+    const startAt = Math.max(0, Math.floor(Number(req.query.t) || 0));
     const settings = loadSettings();
     const fullPath = resolveFilePath(file, tvfile, settings);
     if (!fullPath || !fs.existsSync(fullPath)) return res.status(404).json({ error: 'File not found' });
 
-    const streamId = Buffer.from(target).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
+    const baseId = Buffer.from(target).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
+    const streamId = startAt > 0 ? `${baseId}t${startAt}` : baseId;
     const outDir = path.join(HLS_TMP, streamId);
 
     if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
 
-    // Kill existing stream for this file and clear stale segments
-    if (activeStreams[streamId]) {
-        activeStreams[streamId].kill();
-        delete activeStreams[streamId];
+    const isMkv = target.toLowerCase().endsWith('.mkv');
+    const inputCodec = await probeVideoCodec(fullPath);
+    const isCopyMode = inputCodec === 'h264';
+    const audioMap = await getAudioMap(fullPath, settings);
+    const mp4Path = path.join(HLS_TMP, baseId, 'play.mp4');
+
+    console.log('Input codec:', inputCodec, 'encoder:', videoEncoderLabel, 'copyMode:', isCopyMode, 'startAt:', startAt, 'for', fullPath);
+
+    const mediaToken = createMediaToken();
+
+    if (isCopyMode && cachedMp4IsValid(mp4Path, fullPath)) {
+        console.log('[Remux] Using cached MP4 for:', fullPath);
+        return res.json({
+            mode: 'mp4',
+            streamId: baseId,
+            url: `/stream-cache/${baseId}/play.mp4?token=${mediaToken}`,
+            copyMode: true,
+        });
     }
+
+    // Kill any previous FFmpeg session for this file (any offset) and clear stale segments
+    const prevId = activeByFile[target];
+    if (prevId && activeStreams[prevId]) {
+        activeStreams[prevId].kill('SIGTERM');
+        delete activeStreams[prevId];
+    }
+    activeByFile[target] = streamId;
     for (const f of fs.readdirSync(outDir)) {
         if (f.endsWith('.ts') || f.endsWith('.m3u8')) {
             fs.unlinkSync(path.join(outDir, f));
         }
     }
 
-    const isMkv = target.toLowerCase().endsWith('.mkv');
-
-    const inputCodec = probeVideoCodec(fullPath);
-    const isCopyMode = inputCodec === 'h264';
-    console.log('Input codec:', inputCodec, 'encoder:', videoEncoderLabel, 'copyMode:', isCopyMode, 'for', fullPath);
+    // H.264: start streaming via HLS copy immediately (segmenting is I/O-bound and fast).
+    // The seekable MP4 cache is built in the background for future plays.
+    if (isCopyMode && startAt === 0) {
+        buildCachedMp4InBackground(fullPath, mp4Path, audioMap);
+    }
 
     const videoArgs = buildVideoArgs(inputCodec, isMkv);
-    const audioMap = getAudioMap(fullPath, settings);
-    const headStartTarget = isCopyMode ? 6 : HLS_HEAD_START_SEGMENTS;
+    const headStartTarget = isCopyMode ? HLS_HEAD_START_COPY_SEGMENTS : HLS_HEAD_START_SEGMENTS;
 
     const ffmpegArgs = [
         '-hide_banner', '-loglevel', 'error',
         ...buildDecodeArgs(isCopyMode ? null : hwEncoder),
         '-probesize', '32M', '-analyzeduration', '10M',
+        ...(startAt > 0 ? ['-ss', String(startAt)] : []),
         '-i', fullPath,
         '-map', '0:v:0',
         ...audioMap,
@@ -721,26 +918,33 @@ app.get('/start-stream', async (req, res) => {
     const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
 
     activeStreams[streamId] = ffmpeg;
+    touchStream(streamId);
     console.log('Starting FFmpeg HLS for:', fullPath);
     ffmpeg.stderr.on('data', d => console.error('[FFmpeg]', d.toString().slice(0, 100)));
     ffmpeg.on('error', err => console.error('[FFmpeg spawn error]', err));
     ffmpeg.on('close', () => delete activeStreams[streamId]);
 
     // Let FFmpeg build a head-start buffer before the player begins consuming
-    const headStart = await waitForHeadStart(outDir, headStartTarget, isCopyMode ? 30000 : 90000);
+    const headStart = await waitForHeadStart(outDir, headStartTarget, 90000);
     if (!headStart) {
         console.warn('[HLS] Head-start timeout for', streamId, '- starting with', countHlsSegments(outDir), 'segments');
     } else {
-        console.log('[HLS] Head-start ready:', countHlsSegments(outDir), 'segments for', streamId, isCopyMode ? '(copy)' : '(transcode)');
+        console.log('[HLS] Head-start ready:', countHlsSegments(outDir), 'segments for', streamId, '(transcode)');
     }
 
     res.json({
         mode: 'hls',
         streamId,
-        url: `/hls/${streamId}/index.m3u8`,
+        url: `/hls/${streamId}/index.m3u8?token=${mediaToken}`,
         encodedSeconds: getEncodedDuration(outDir),
         copyMode: isCopyMode,
+        startOffset: startAt,
     });
+});
+
+// Media token for direct-play URLs (iOS native player sends no cookies)
+app.get('/api/media-token', (req, res) => {
+    res.json({ token: createMediaToken() });
 });
 
 // Range request support for MP4
@@ -749,30 +953,7 @@ app.get('/stream-mp4', (req, res) => {
     const settings = loadSettings();
     const fullPath = resolveMediaPath(file, getMediaFolders(settings));
     if (!fullPath) return res.status(404).send('File not found');
-    const stat = fs.statSync(fullPath);
-    const fileSize = stat.size;
-    const range = req.headers.range;
-    if (range) {
-        const parts = range.replace(/bytes=/, '').split('-');
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-        const chunkSize = (end - start) + 1;
-        const fileStream = fs.createReadStream(fullPath, { start, end });
-        res.writeHead(206, {
-            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-            'Accept-Ranges': 'bytes',
-            'Content-Length': chunkSize,
-            'Content-Type': 'video/mp4',
-        });
-        fileStream.pipe(res);
-    } else {
-        res.writeHead(200, {
-            'Content-Length': fileSize,
-            'Content-Type': 'video/mp4',
-            'Accept-Ranges': 'bytes',
-        });
-        fs.createReadStream(fullPath).pipe(res);
-    }
+    sendMp4Range(req, res, fullPath);
 });
 
 app.get('/download', (req, res) => {

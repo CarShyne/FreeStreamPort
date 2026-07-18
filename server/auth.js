@@ -218,6 +218,47 @@ function clearSessionCookie(res) {
     );
 }
 
+// --- Media tokens ---
+// iOS/Safari's native video player fetches HLS playlists, segments, and MP4s
+// via a separate media process that does NOT send the page's cookies. Media
+// routes therefore accept a short-lived token in the URL instead.
+const MEDIA_TOKEN_MS = 12 * 60 * 60 * 1000;
+const mediaTokens = new Map();
+
+export function createMediaToken() {
+    const now = Date.now();
+    if (mediaTokens.size > 500) {
+        for (const [t, exp] of mediaTokens) {
+            if (exp <= now) mediaTokens.delete(t);
+        }
+    }
+    const token = crypto.randomBytes(24).toString('hex');
+    mediaTokens.set(token, now + MEDIA_TOKEN_MS);
+    return token;
+}
+
+export function validateMediaToken(token) {
+    if (!token) return false;
+    const expires = mediaTokens.get(token);
+    if (!expires) return false;
+    if (Date.now() > expires) {
+        mediaTokens.delete(token);
+        return false;
+    }
+    return true;
+}
+
+function isMediaPath(req) {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return false;
+    return req.path.startsWith('/hls/')
+        || req.path.startsWith('/stream-cache/')
+        || req.path.startsWith('/tv-media/')
+        || req.path.startsWith('/media/')
+        || req.path === '/stream-mp4'
+        || req.path === '/stream-remux'
+        || req.path === '/download';
+}
+
 function isPublicPath(req) {
     if (req.path === '/api/auth/login' && req.method === 'POST') return true;
     if (req.path === '/api/auth/status' && req.method === 'GET') return true;
@@ -235,6 +276,7 @@ function isStaticAsset(req) {
 export function authMiddleware(req, res, next) {
     if (isPublicPath(req)) return next();
     if (validateSession(getSessionToken(req))) return next();
+    if (isMediaPath(req) && validateMediaToken(req.query.token)) return next();
     if (isStaticAsset(req)) return next();
 
     if (req.path.startsWith('/api/') || req.accepts('json')) {

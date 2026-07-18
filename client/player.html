@@ -88,9 +88,10 @@
         }
         body.show-controls .player-btn { opacity: 1; }
         .player-btn:hover { background: rgba(255,255,255,0.15); color: #fff; }
-        #close-btn { bottom: 80px; left: 24px; }
-        #fullscreen-btn { bottom: 80px; left: 76px; }
-        #fit-btn { bottom: 80px; left: 168px; }
+        /* env() is 0 on desktop — only shifts on notched iPhones */
+        #close-btn { bottom: calc(80px + env(safe-area-inset-bottom)); left: calc(24px + env(safe-area-inset-left)); }
+        #fullscreen-btn { bottom: calc(80px + env(safe-area-inset-bottom)); left: calc(76px + env(safe-area-inset-left)); }
+        #fit-btn { bottom: calc(80px + env(safe-area-inset-bottom)); left: calc(168px + env(safe-area-inset-left)); }
     </style>
 </head>
 <body>
@@ -134,6 +135,8 @@
     function toggleFullscreen() {
         if (document.fullscreenElement || document.webkitFullscreenElement) {
             (document.exitFullscreen || document.webkitExitFullscreen)?.call(document);
+        } else if (player.webkitDisplayingFullscreen) {
+            try { player.webkitExitFullscreen(); } catch (_) {}
         } else {
             enterFullscreen();
         }
@@ -142,7 +145,21 @@
 
     function enterFullscreen() {
         const el = document.documentElement;
-        return (el.requestFullscreen || el.webkitRequestFullscreen)?.call(el);
+        const req = el.requestFullscreen || el.webkitRequestFullscreen;
+        if (req) {
+            const r = req.call(el);
+            if (r && r.catch) r.catch(() => enterVideoFullscreen());
+            return r;
+        }
+        // iPhone Safari: page fullscreen unsupported — use the video element's
+        // native fullscreen (hides tabs/URL bar completely)
+        return enterVideoFullscreen();
+    }
+
+    function enterVideoFullscreen() {
+        try {
+            if (player.webkitEnterFullscreen) player.webkitEnterFullscreen();
+        } catch (_) {}
     }
 
     function showError(message) {
@@ -154,15 +171,32 @@
         return path.split('/').map(encodeURIComponent).join('/');
     }
 
-    const HLS_START_BUFFER_SEC = 20;
+    let mediaToken = null;
+    async function getMediaToken() {
+        if (mediaToken) return mediaToken;
+        try {
+            const res = await fetch('/api/media-token', { credentials: 'same-origin' });
+            if (res.ok) mediaToken = (await res.json()).token;
+        } catch (_) {}
+        return mediaToken;
+    }
+
+    function withToken(url, token) {
+        if (!token) return url;
+        return url + (url.includes('?') ? '&' : '?') + 'token=' + token;
+    }
+
+    const HLS_START_BUFFER_SEC = 15;
     const HLS_START_BUFFER_COPY_SEC = 8;
+    const HLS_START_BUFFER_NATIVE_SEC = 25;
+    const HLS_START_BUFFER_NATIVE_COPY_SEC = 12;
     const MP4_START_BUFFER_SEC = 5;
     const HLS_MIN_PLAY_BUFFER_SEC = 8;
-    const HLS_MIN_PLAY_COPY_SEC = 4;
-    const HLS_RESUME_BUFFER_SEC = 20;
+    const HLS_MIN_PLAY_COPY_SEC = 5;
+    const HLS_RESUME_BUFFER_SEC = 15;
     const HLS_RESUME_COPY_SEC = 10;
-    const HLS_ENCODE_LEAD_SEC = 12;
-    const HLS_ENCODE_LEAD_COPY_SEC = 6;
+    const HLS_ENCODE_LEAD_SEC = 20;
+    const HLS_ENCODE_LEAD_COPY_SEC = 8;
     let playbackStarted = false;
     let stallTimer = null;
     let bufferWatchdog = null;
@@ -172,10 +206,18 @@
     let pausedForBuffer = false;
     let hlsStreamId = null;
     let encodedAheadSec = Infinity;
+    let lastEncodedSeconds = Infinity;
     let hlsCopyMode = false;
     let usingNativeHls = false;
+    let liveEdgeFixInterval = null;
+    let streamTimeOffset = 0;
+    let seekRestartBound = false;
+    let seekRestartInProgress = false;
 
     function hlsStartBufferSec() {
+        if (usingNativeHls) {
+            return hlsCopyMode ? HLS_START_BUFFER_NATIVE_COPY_SEC : HLS_START_BUFFER_NATIVE_SEC;
+        }
         return hlsCopyMode ? HLS_START_BUFFER_COPY_SEC : HLS_START_BUFFER_SEC;
     }
 
@@ -224,13 +266,77 @@
         return minSeconds;
     }
 
-    function tryStartPlayback(minSeconds) {
+    function isStuckAtLiveEdge() {
+        const ct = player.currentTime;
+        const d = player.duration;
+        if (!isFinite(d) || d <= 0) return ct > 15;
+        if (ct > d * 0.7) return true;
+        if (!playbackStarted && ct > 20 && bufferedAhead() < hlsStartBufferSec()) return true;
+        return false;
+    }
+
+    function forceStartFromBeginning() {
+        if (player.currentTime > 0.25) {
+            try { player.currentTime = 0; } catch (_) {}
+        }
+    }
+
+    function bufferAnchorIsNearStart() {
+        const ranges = player.buffered;
+        if (!ranges.length) return false;
+        return ranges.start(0) < 8;
+    }
+
+    function hasBufferFromPlayhead(minSeconds) {
+        const ahead = bufferedAhead();
+        if (ahead < bufferTarget(minSeconds)) return false;
+        const ct = player.currentTime;
+        if (!playbackStarted && ct > 3) return false;
+        if (!playbackStarted && !bufferAnchorIsNearStart()) return false;
+        return true;
+    }
+
+    function tryStartPlayback(minSeconds, strict) {
         if (playbackStarted) return;
-        if (bufferedAhead() >= bufferTarget(minSeconds) || player.readyState >= 3) {
+        const encodeReady = !hlsStreamId || encodedAheadSec >= hlsEncodeLeadSec();
+        const strictMode = strict || usingNativeHls;
+
+        if (isStuckAtLiveEdge()) {
+            showInitialLoading('Starting from beginning...');
+            forceStartFromBeginning();
+            return;
+        }
+
+        if (strictMode) {
+            if (!hasBufferFromPlayhead(minSeconds) || !encodeReady) return;
+            forceStartFromBeginning();
             playbackStarted = true;
             hideLoading();
-            player.play().catch(() => {});
+            player.play().catch(() => showTapToPlay());
+            return;
         }
+
+        const ahead = bufferedAhead();
+        if ((ahead >= bufferTarget(minSeconds) || player.readyState >= 3) && encodeReady) {
+            playbackStarted = true;
+            hideLoading();
+            player.play().catch(() => showTapToPlay());
+        }
+    }
+
+    function startLiveEdgeGuard() {
+        if (liveEdgeFixInterval) clearInterval(liveEdgeFixInterval);
+        liveEdgeFixInterval = setInterval(() => {
+            if (playbackStarted) {
+                clearInterval(liveEdgeFixInterval);
+                liveEdgeFixInterval = null;
+                return;
+            }
+            if (isStuckAtLiveEdge()) {
+                showInitialLoading('Starting from beginning...');
+                forceStartFromBeginning();
+            }
+        }, 250);
     }
 
     function scheduleStallRecovery() {
@@ -269,9 +375,14 @@
         }
         pausedForBuffer = false;
         encodedAheadSec = Infinity;
+        lastEncodedSeconds = Infinity;
         hlsStreamId = null;
         hlsCopyMode = false;
         usingNativeHls = false;
+        if (liveEdgeFixInterval) {
+            clearInterval(liveEdgeFixInterval);
+            liveEdgeFixInterval = null;
+        }
     }
 
     async function pollEncodeLead() {
@@ -280,6 +391,7 @@
             const res = await fetch(`/hls/${hlsStreamId}/status`);
             if (!res.ok) return;
             const { encodedSeconds } = await res.json();
+            lastEncodedSeconds = encodedSeconds;
             encodedAheadSec = encodedSeconds - player.currentTime;
         } catch (_) {}
     }
@@ -292,6 +404,11 @@
 
     function needsBufferPause() {
         if (!hlsInstance && !usingNativeHls) return false;
+        if (usingNativeHls) {
+            // Native HLS: only gate on the encoder falling behind, never on
+            // buffered ranges (unreliable on iOS)
+            return Boolean(hlsStreamId) && encodedAheadSec < hlsEncodeLeadSec() / 2;
+        }
         const ahead = bufferedAhead();
         if (ahead < hlsMinPlayBufferSec()) return true;
         if (hlsStreamId && encodedAheadSec < hlsEncodeLeadSec()) return true;
@@ -299,6 +416,9 @@
     }
 
     function canResumeFromBuffer() {
+        if (usingNativeHls) {
+            return !hlsStreamId || encodedAheadSec >= hlsEncodeLeadSec();
+        }
         return bufferedAhead() >= hlsResumeBufferSec()
             && (!hlsStreamId || encodedAheadSec >= hlsEncodeLeadSec());
     }
@@ -311,8 +431,11 @@
             scheduleStallRecovery();
         });
         player.addEventListener('stalled', scheduleStallRecovery);
-        player.addEventListener('canplay', () => { if (!pausedForBuffer) hideLoading(); });
-        player.addEventListener('playing', () => { if (!pausedForBuffer) hideLoading(); });
+        player.addEventListener('canplay', () => { if (!pausedForBuffer && playbackStarted) hideLoading(); });
+        player.addEventListener('playing', () => {
+            playbackStarted = true;
+            if (!pausedForBuffer) hideLoading();
+        });
     }
 
     function playDirect(url, onErrorFallback) {
@@ -326,6 +449,10 @@
         player.addEventListener('progress', onProgress);
         player.addEventListener('canplay', onProgress);
         player.addEventListener('canplaythrough', onProgress, { once: true });
+        // iOS won't fetch any data until play() is called — kick it if nothing loaded
+        setTimeout(() => {
+            if (!playbackStarted && player.readyState === 0) tryNativePlay();
+        }, 1500);
         setTimeout(() => {
             if (!playbackStarted && player.readyState >= 2) tryStartPlayback(0.5);
         }, 8000);
@@ -334,24 +461,89 @@
         }, { once: true });
     }
 
+    // Seeking past the encoded point would stall forever — instead restart
+    // the transcode at the target time (server -ss) and play the new session.
+    function bindSeekRestart() {
+        if (seekRestartBound) return;
+        seekRestartBound = true;
+        player.addEventListener('seeking', () => {
+            if (!hlsStreamId || seekRestartInProgress || !playbackStarted) return;
+            if (!isFinite(lastEncodedSeconds)) return;
+            const target = player.currentTime;
+            if (target > lastEncodedSeconds + 4) {
+                restartStreamAt(streamTimeOffset + target);
+            }
+        });
+    }
+
+    async function restartStreamAt(absSeconds) {
+        seekRestartInProgress = true;
+        try {
+            const tvfile = new URLSearchParams(window.location.search).get('tvfile');
+            showInitialLoading('Seeking...');
+            const endpoint = (tvfile
+                ? '/start-stream?tvfile=' + encodeURIComponent(tvfile)
+                : '/start-stream?file=' + encodeURIComponent(file))
+                + '&t=' + Math.max(0, Math.floor(absSeconds));
+            const res = await fetch(endpoint);
+            if (!res.ok) { showError('Seek failed'); return; }
+            const data = await res.json();
+            if (data.mode === 'mp4') {
+                streamTimeOffset = 0;
+                playDirect(data.url);
+                player.addEventListener('loadedmetadata', () => {
+                    try { player.currentTime = absSeconds; } catch (_) {}
+                }, { once: true });
+                return;
+            }
+            streamTimeOffset = data.startOffset || 0;
+            playHls(data.url, data.streamId, data.copyMode);
+        } catch (_) {
+            showError('Seek failed');
+        } finally {
+            seekRestartInProgress = false;
+        }
+    }
+
+    function tryNativePlay() {
+        const p = player.play();
+        if (p && p.catch) p.catch(() => showTapToPlay());
+    }
+
+    function showTapToPlay() {
+        if (!player.paused) return;
+        loading.classList.remove('rebuffer');
+        loading.style.display = 'flex';
+        loading.textContent = '▶ Tap to play';
+        const onTap = () => {
+            loading.removeEventListener('click', onTap);
+            showInitialLoading('Loading...');
+            tryNativePlay();
+        };
+        loading.addEventListener('click', onTap);
+    }
+
     function playHls(url, streamId, copyMode) {
         playbackStarted = false;
         mediaRecoveries = 0;
         hlsStreamId = streamId || null;
         hlsCopyMode = Boolean(copyMode);
         encodedAheadSec = Infinity;
+        lastEncodedSeconds = Infinity;
         usingNativeHls = false;
+        bindSeekRestart();
         if (window.Hls && Hls.isSupported()) {
             if (hlsInstance) hlsInstance.destroy();
             hlsInstance = new Hls({
                 enableWorker: true,
+                startPosition: 0,
                 maxBufferLength: 180,
                 maxMaxBufferLength: 600,
                 maxBufferHole: 0.5,
                 startFragPrefetch: true,
                 lowLatencyMode: false,
-                liveSyncDurationCount: 8,
-                liveMaxLatencyDurationCount: 30,
+                liveSyncDuration: 45,
+                liveMaxLatencyDuration: 120,
                 maxLiveSyncPlaybackRate: 1,
                 manifestLoadingMaxRetry: 8,
                 levelLoadingMaxRetry: 8,
@@ -365,13 +557,15 @@
             if (hlsStreamId) startEncodeLeadWatch();
             showInitialLoading('Loading...');
 
-            const onBuffered = () => tryStartPlayback(hlsStartBufferSec());
+            const onBuffered = () => {
+                if (!playbackStarted && player.currentTime > 3) player.currentTime = 0;
+                tryStartPlayback(hlsStartBufferSec(), true);
+            };
             hlsInstance.on(Hls.Events.BUFFER_APPENDED, onBuffered);
             hlsInstance.on(Hls.Events.FRAG_BUFFERED, onBuffered);
             hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
-                setTimeout(() => {
-                    if (!playbackStarted && bufferedAhead() > 0.5) tryStartPlayback(0.5);
-                }, 12000);
+                player.currentTime = 0;
+                hlsInstance.startLoad(0);
             });
 
             hlsInstance.on(Hls.Events.ERROR, (_, data) => {
@@ -391,20 +585,23 @@
             return;
         }
         if (player.canPlayType('application/vnd.apple.mpegurl')) {
+            // iOS/Safari native HLS. Two iOS rules shape this code:
+            // 1. iOS ignores preload and won't fetch ANY media data until play()
+            //    is called — so waiting for canplay before playing deadlocks.
+            // 2. Un-muted autoplay may be rejected without a user gesture — then
+            //    we show a tap-to-play prompt; the tap satisfies the gesture rule.
             usingNativeHls = true;
             playbackStarted = false;
-            showInitialLoading('Loading...');
             bindPlayerRecovery();
             startBufferWatchdog();
             if (hlsStreamId) startEncodeLeadWatch();
+            showInitialLoading('Loading...');
             player.src = url;
-            const onProgress = () => tryStartPlayback(hlsStartBufferSec());
-            player.addEventListener('progress', onProgress);
-            player.addEventListener('canplay', onProgress);
-            player.addEventListener('canplaythrough', onProgress, { once: true });
-            setTimeout(() => {
-                if (!playbackStarted && player.readyState >= 2) tryStartPlayback(0.5);
-            }, 12000);
+            player.addEventListener('playing', () => {
+                playbackStarted = true;
+                if (!pausedForBuffer) hideLoading();
+            });
+            tryNativePlay();
             return;
         }
         showError('HLS not supported in this browser');
@@ -413,6 +610,7 @@
     async function startHlsStream() {
         playbackStarted = false;
         mediaRecoveries = 0;
+        streamTimeOffset = 0;
         stopBufferWatchdog();
         const tvfile = new URLSearchParams(window.location.search).get('tvfile');
         showInitialLoading('Preparing stream...');
@@ -428,6 +626,10 @@
             return;
         }
         const data = await res.json();
+        if (data.mode === 'mp4') {
+            playDirect(data.url);
+            return;
+        }
         playHls(data.url, data.streamId, data.copyMode);
     }
 
@@ -440,9 +642,10 @@
         }
 
         if (target.toLowerCase().endsWith('.mp4')) {
-            const url = tvfile
+            const token = await getMediaToken();
+            const url = withToken(tvfile
                 ? '/tv-media/' + mediaUrl(tvfile)
-                : '/stream-mp4?file=' + encodeURIComponent(file);
+                : '/stream-mp4?file=' + encodeURIComponent(file), token);
             playDirect(url, () => startHlsStream());
             return;
         }
@@ -468,7 +671,10 @@
     ensureAuth().then(ok => { if (ok) startStream(); });
 
     // Fullscreen helps tab/screen cast fill the TV instead of mirroring a small window
-    enterFullscreen().catch(() => {});
+    try {
+        const fsAttempt = enterFullscreen();
+        if (fsAttempt && fsAttempt.catch) fsAttempt.catch(() => {});
+    } catch (_) {}
 </script>
 </body>
 </html>
